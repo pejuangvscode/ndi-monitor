@@ -1,34 +1,22 @@
 package com.example.myapplication
 
+import android.content.pm.ActivityInfo
+import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.tooling.preview.Preview
-import com.example.myapplication.ui.theme.MyApplicationTheme
-import android.view.SurfaceView
-import androidx.compose.ui.viewinterop.AndroidView
-import android.view.SurfaceHolder
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.launch
-import android.content.Context
-import android.net.wifi.WifiManager
-import android.util.Log
-import android.widget.FrameLayout
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.compose.ui.graphics.Color
-import androidx.compose.foundation.background
+import com.example.myapplication.ui.theme.MyApplicationTheme
 
-private const val TAG = "MainActivity"
+data class NDIDevice(
+    val deviceName: String,
+    val sources: List<String>
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -37,134 +25,86 @@ class MainActivity : ComponentActivity() {
     }
 
     external fun startNDIReceiver(surface: Any)
+    external fun getNDIDevicesAndSources(): Array<String>
+    external fun connectToNDISource(sourceFullName: String, surface: Any): Boolean
+    external fun stopNDIReceiver()
 
-    var multicastLock: WifiManager.MulticastLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         enableEdgeToEdge()
+
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-        windowInsetsController.hide(WindowInsetsCompat.Type.statusBars())
+        windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
         windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
+        // Get dark mode state from intent
+        val initialDarkMode = intent.getBooleanExtra("isDarkMode", false)
+
         setContent {
+            var isDarkMode by remember { mutableStateOf(initialDarkMode) }
             MyApplicationTheme {
-                NDIMonitor()
+                NDIMonitorScreen(
+                    isDarkMode = isDarkMode,
+                    onToggleTheme = { isDarkMode = !isDarkMode },
+                    onBack = { finish() },
+                    onGetDevices = { getDevicesAndSources() },
+                    onConnectToSource = { sourceName, surface ->
+                        connectToNDISource(sourceName, surface)
+                    }
+                )
             }
         }
     }
-}
 
-// Custom FrameLayout that maintains 16:9 aspect ratio
-class AspectRatioFrameLayout(context: Context) : FrameLayout(context) {
-    private val targetAspectRatio = 16f / 9f
+    private fun getDevicesAndSources(): List<NDIDevice> {
+        try {
+            val devicesData = getNDIDevicesAndSources()
+            Log.d("MainActivity", "Got ${devicesData.size} devices from NDI")
 
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val originalWidth = MeasureSpec.getSize(widthMeasureSpec)
-        val originalHeight = MeasureSpec.getSize(heightMeasureSpec)
+            return devicesData.map { deviceData ->
+                val parts = deviceData.split("|||")
+                if (parts.isEmpty()) {
+                    Log.w("MainActivity", "Empty device data")
+                    return@map NDIDevice("Unknown", emptyList())
+                }
 
-        val containerAspectRatio = originalWidth.toFloat() / originalHeight.toFloat()
+                val deviceName = parts[0]
+                val sources = parts.drop(1) // All parts after device name are sources
 
-        val finalWidth: Int
-        val finalHeight: Int
+                Log.d("MainActivity", "Device: $deviceName with ${sources.size} sources")
+                sources.forEachIndexed { index, source ->
+                    Log.d("MainActivity", "  Source $index: $source")
+                }
 
-        if (containerAspectRatio > targetAspectRatio) {
-            // Container is wider than target - fit by height
-            finalHeight = originalHeight
-            finalWidth = (originalHeight * targetAspectRatio).toInt()
-        } else {
-            // Container is taller than target - fit by width
-            finalWidth = originalWidth
-            finalHeight = (originalWidth / targetAspectRatio).toInt()
+                NDIDevice(deviceName, sources)
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error getting NDI devices", e)
+            return emptyList()
         }
-
-        super.onMeasure(
-            MeasureSpec.makeMeasureSpec(finalWidth, MeasureSpec.EXACTLY),
-            MeasureSpec.makeMeasureSpec(finalHeight, MeasureSpec.EXACTLY)
-        )
     }
-}
 
-@Composable
-fun NDIMonitor() {
-    val configuration = LocalConfiguration.current
-    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black),
-        contentAlignment = Alignment.Center
-    ) {
-        // NDI Video Surface - fit screen with aspect ratio maintained
-        AndroidView(
-            factory = { context ->
-                // Wrap SurfaceView in AspectRatioFrameLayout
-                val aspectRatioLayout = AspectRatioFrameLayout(context).apply {
-                    setBackgroundColor(android.graphics.Color.BLACK)
-                }
-
-                val surfaceView = SurfaceView(context).apply {
-                    layoutParams = FrameLayout.LayoutParams(
-                        FrameLayout.LayoutParams.MATCH_PARENT,
-                        FrameLayout.LayoutParams.MATCH_PARENT
-                    )
-                }
-
-                aspectRatioLayout.addView(surfaceView)
-
-                surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) {
-                        // Acquire multicast lock
-                        try {
-                            val wifi = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                            (context as MainActivity).multicastLock = wifi.createMulticastLock("ndi_multicast_lock")
-                            (context as MainActivity).multicastLock?.setReferenceCounted(true)
-                            (context as MainActivity).multicastLock?.acquire()
-                            Log.i(TAG, "Multicast lock acquired successfully")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to acquire multicast lock", e)
-                        }
-
-                        // Start NDI receiver
-                        val activity = context as MainActivity
-                        activity.lifecycleScope.launch {
-                            activity.startNDIReceiver(holder.surface)
-                        }
-                    }
-
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                        // Aspect ratio maintained by parent layout
-                    }
-
-                    override fun surfaceDestroyed(holder: SurfaceHolder) {
-                        // Release multicast lock
-                        try {
-                            (context as MainActivity).multicastLock?.let {
-                                if (it.isHeld) it.release()
-                            }
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed to release multicast lock", e)
-                        }
-                    }
-                })
-
-                aspectRatioLayout
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+    fun acquireMulticastLock(wifi: WifiManager) {
+        if (multicastLock == null) {
+            multicastLock = wifi.createMulticastLock("ndi_lock").apply { setReferenceCounted(true) }
+        }
+        multicastLock?.let { if (!it.isHeld) it.acquire() }
     }
-}
 
-@Composable
-fun Greeting(name: String, modifier: Modifier = Modifier) {
-    Text(
-        text = "Hello $name!",
-        modifier = modifier
-    )
-}
+    fun releaseMulticastLock() {
+        try {
+            multicastLock?.let { lock -> if (lock.isHeld) lock.release() }
+        } catch (e: Exception) {
+            Log.w("MainActivity", "Gagal melepas multicast lock", e)
+        }
+    }
 
-@Preview(showBackground = true)
-@Composable
-fun GreetingPreview() {
-    MyApplicationTheme {
-        Greeting("Android")
+    override fun onDestroy() {
+        super.onDestroy()
+        stopNDIReceiver()
+        releaseMulticastLock()
     }
 }

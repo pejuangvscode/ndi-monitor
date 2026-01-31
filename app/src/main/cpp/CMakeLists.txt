@@ -30,4 +30,5 @@ endif()
 target_link_libraries(native-lib
     ndi
     ${log-lib}
-    ${android-lib})
+    ${android-lib}
+    c++_shared)
