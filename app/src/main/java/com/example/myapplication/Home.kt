@@ -21,20 +21,9 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-
-// Definisi Outfit Font Family
-val outfitFontFamily = FontFamily(
-    Font(R.font.outfit_light, FontWeight.Light),
-    Font(R.font.outfit_regular, FontWeight.Normal),
-    Font(R.font.outfit_medium, FontWeight.Medium),
-    Font(R.font.outfit_semibold, FontWeight.SemiBold),
-    Font(R.font.outfit_bold, FontWeight.Bold)
-)
 
 @Composable
 fun HomeScreen(
@@ -43,32 +32,27 @@ fun HomeScreen(
     onStartMonitor: () -> Unit
 ) {
     val context = LocalContext.current
-
-    // Pastikan saat di Home, orientasi kembali ke sensor normal atau portrait
-    // agar transisinya bersih saat akan masuk ke monitor
     SideEffect {
         val activity = context as? Activity
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 
     if (!isDarkMode) {
-        // =========================
         // LIGHT MODE
-        // =========================
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color(0xFFB8C5D6),
-                            Color(0xFFA8B5C6),
-                            Color(0xFF8A99AA)
+                            Color(0xFFA7B3C4),
+                            Color(0xFFC9C9C9),
+                            Color(0xFFC9C9C9),
+                            Color(0xFF616D7D)
                         )
                     )
                 )
         ) {
-            // Logo NDI TOOLS
             Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -82,7 +66,7 @@ fun HomeScreen(
                     style = TextStyle(
                         fontSize = 26.sp,
                         fontWeight = FontWeight.Bold,
-                        fontFamily = outfitFontFamily
+                        fontFamily = poppinsFontFamily
                     )
                 )
                 Spacer(modifier = Modifier.width(2.dp))
@@ -92,7 +76,7 @@ fun HomeScreen(
                     style = TextStyle(
                         fontSize = 26.sp,
                         fontWeight = FontWeight.Light,
-                        fontFamily = outfitFontFamily,
+                        fontFamily = poppinsFontFamily,
                         letterSpacing = 0.5.sp
                     ),
                     modifier = Modifier.offset(y = 0.dp)
@@ -118,8 +102,8 @@ fun HomeScreen(
                         .background(
                             brush = Brush.linearGradient(
                                 colors = listOf(
-                                    Color(0xFFFFC107),
-                                    Color(0xFFFF9800)
+                                    Color(0xFFEEBC60),
+                                    Color(0xFFB76C00)
                                 )
                             )
                         ),
@@ -129,7 +113,7 @@ fun HomeScreen(
                         painter = painterResource(id = R.drawable.ic_sunny),
                         contentDescription = "Sun Icon",
                         colorFilter = ColorFilter.tint(Color.White),
-                        modifier = Modifier.size(13.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
@@ -139,23 +123,21 @@ fun HomeScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .offset(y = (-100).dp)
-                    .width(300.dp)
-                    .height(70.dp)
-                    .clip(RoundedCornerShape(35.dp))
+                    .width(240.dp)
+                    .height(65.dp)
+                    .clip(RoundedCornerShape(18.dp))
                     .background(
                         brush = Brush.horizontalGradient(
                             colors = listOf(
-                                Color(0xFF2E3842),
-                                Color(0xFF1F2831)
+                                Color(0xFF1B1F26),
+                                Color(0xFF3F4959),
+                                Color(0xFF1B1F26)
                             )
                         )
                     )
                     .clickable {
-                        // Sebelum navigasi, set ke sensor agar saat masuk monitor langsung mengikuti posisi HP
                         val activity = context as? Activity
                         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-
-                        // Pass isDarkMode state to MainActivity
                         val intent = Intent(context, MainActivity::class.java)
                         intent.putExtra("isDarkMode", isDarkMode)
                         context.startActivity(intent)
@@ -169,16 +151,16 @@ fun HomeScreen(
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(54.dp)
+                            .size(40.dp)
                             .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF3D4954)),
+                            .background(Color(0xE5D1CED3)),
                         contentAlignment = Alignment.Center
                     ) {
                         Image(
-                            painter = painterResource(id = R.drawable.ic_monitor_dark),
+                            painter = painterResource(id = R.drawable.ic_monitor_light),
                             contentDescription = "Monitor Icon",
-                            colorFilter = ColorFilter.tint(Color.White),
-                            modifier = Modifier.size(28.dp)
+                            colorFilter = ColorFilter.tint(Color.Black),
+                            modifier = Modifier.size(22.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(18.dp))
@@ -186,33 +168,31 @@ fun HomeScreen(
                         text = "Studio Monitor",
                         color = Color.White,
                         style = TextStyle(
-                            fontSize = 22.sp,
+                            fontSize = 16.sp,
                             fontWeight = FontWeight.SemiBold,
-                            fontFamily = outfitFontFamily,
-                            letterSpacing = 0.3.sp
+                            fontFamily = poppinsFontFamily,
+                            letterSpacing = 0.sp
                         )
                     )
                 }
             }
         }
     } else {
-        // =========================
         // DARK MODE
-        // =========================
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     brush = Brush.verticalGradient(
                         colors = listOf(
-                            Color(0xFF1A2332),
-                            Color(0xFF0D1419),
-                            Color(0xFF0A0E13)
+                            Color(0xFF141920),
+                            Color(0xFF323232),
+                            Color(0xFF323232),
+                            Color(0xFF21252E)
                         )
                     )
                 )
         ) {
-            // Logo NDI TOOLS
             Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -226,7 +206,7 @@ fun HomeScreen(
                     style = TextStyle(
                         fontSize = 26.sp,
                         fontWeight = FontWeight.Bold,
-                        fontFamily = outfitFontFamily
+                        fontFamily = poppinsFontFamily
                     )
                 )
                 Spacer(modifier = Modifier.width(2.dp))
@@ -236,7 +216,7 @@ fun HomeScreen(
                     style = TextStyle(
                         fontSize = 26.sp,
                         fontWeight = FontWeight.Light,
-                        fontFamily = outfitFontFamily,
+                        fontFamily = poppinsFontFamily,
                         letterSpacing = 0.5.sp
                     ),
                     modifier = Modifier.offset(y = 0.dp)
@@ -250,7 +230,7 @@ fun HomeScreen(
                     .offset(x = (-38).dp, y = 54.dp)
                     .size(width = 62.dp, height = 34.dp)
                     .clip(RoundedCornerShape(17.dp))
-                    .background(Color(0xFF3A4149))
+                    .background(Color(0xFF535353))
                     .clickable { onToggleTheme() },
                 contentAlignment = Alignment.CenterEnd
             ) {
@@ -262,8 +242,8 @@ fun HomeScreen(
                         .background(
                             brush = Brush.linearGradient(
                                 colors = listOf(
-                                    Color(0xFF596576).copy(alpha = 0.9f),
-                                    Color(0xFF394555).copy(alpha = 0.9f)
+                                    Color(0xB3596576),
+                                    Color(0xCC213148)
                                 )
                             )
                         ),
@@ -283,23 +263,20 @@ fun HomeScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .offset(y = (-100).dp)
-                    .width(300.dp)
-                    .height(70.dp)
-                    .clip(RoundedCornerShape(35.dp))
+                    .width(240.dp)
+                    .height(65.dp)
+                    .clip(RoundedCornerShape(18.dp))
                     .background(
                         brush = Brush.horizontalGradient(
                             colors = listOf(
-                                Color(0xFFF5EFE0),
-                                Color(0xFFE8DCC8)
+                                Color(0xB3FFFFFF),
+                                Color(0xE5F4E6C8)
                             )
                         )
                     )
                     .clickable {
-                        // Sebelum navigasi, set ke sensor agar saat masuk monitor langsung mengikuti posisi HP
                         val activity = context as? Activity
                         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-
-                        // Pass isDarkMode state to MainActivity
                         val intent = Intent(context, MainActivity::class.java)
                         intent.putExtra("isDarkMode", isDarkMode)
                         context.startActivity(intent)
@@ -313,16 +290,16 @@ fun HomeScreen(
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(54.dp)
+                            .size(40.dp)
                             .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF4A453E)),
+                            .background(Color(0xFF605855)),
                         contentAlignment = Alignment.Center
                     ) {
                         Image(
                             painter = painterResource(id = R.drawable.ic_monitor_dark),
                             contentDescription = "Monitor Icon",
                             colorFilter = ColorFilter.tint(Color.White),
-                            modifier = Modifier.size(28.dp)
+                            modifier = Modifier.size(22.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(18.dp))
@@ -330,9 +307,9 @@ fun HomeScreen(
                         text = "Studio Monitor",
                         color = Color(0xFF2B2824),
                         style = TextStyle(
-                            fontSize = 22.sp,
+                            fontSize = 16.sp,
                             fontWeight = FontWeight.SemiBold,
-                            fontFamily = outfitFontFamily,
+                            fontFamily = poppinsFontFamily,
                             letterSpacing = 0.3.sp
                         )
                     )

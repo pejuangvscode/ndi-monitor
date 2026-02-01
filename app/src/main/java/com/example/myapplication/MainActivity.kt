@@ -11,7 +11,12 @@ import androidx.compose.runtime.*
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.myapplication.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 data class NDIDevice(
     val deviceName: String,
@@ -26,8 +31,10 @@ class MainActivity : ComponentActivity() {
 
     external fun startNDIReceiver(surface: Any)
     external fun getNDIDevicesAndSources(): Array<String>
-    external fun connectToNDISource(sourceFullName: String, surface: Any): Boolean
+    external fun connectToNDISource(sourceFullName: String, surface: Any, quality: Int): Boolean
     external fun stopNDIReceiver()
+    external fun initializeNDIFinder(): Boolean
+    external fun startContinuousDiscovery()
 
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -40,7 +47,28 @@ class MainActivity : ComponentActivity() {
         windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
         windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
 
-        // Get dark mode state from intent
+        // PRE-INITIALIZE NDI for instant detection
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                Log.d("MainActivity", "Pre-initializing NDI finder...")
+                val initialized = initializeNDIFinder()
+                Log.d("MainActivity", "NDI Finder pre-initialized: $initialized")
+
+                if (initialized) {
+                    // Start continuous background discovery
+                    startContinuousDiscovery()
+                    Log.d("MainActivity", "Continuous discovery started")
+
+                    // Pre-scan for devices
+                    delay(200) // Small delay to let discovery start
+                    val devices = getDevicesAndSources()
+                    Log.d("MainActivity", "Pre-scan found ${devices.size} devices")
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to pre-initialize NDI", e)
+            }
+        }
+
         val initialDarkMode = intent.getBooleanExtra("isDarkMode", false)
 
         setContent {
@@ -51,8 +79,8 @@ class MainActivity : ComponentActivity() {
                     onToggleTheme = { isDarkMode = !isDarkMode },
                     onBack = { finish() },
                     onGetDevices = { getDevicesAndSources() },
-                    onConnectToSource = { sourceName, surface ->
-                        connectToNDISource(sourceName, surface)
+                    onConnectToSource = { sourceName, surface, quality ->
+                        connectToNDISource(sourceName, surface, quality)
                     }
                 )
             }
@@ -62,22 +90,15 @@ class MainActivity : ComponentActivity() {
     private fun getDevicesAndSources(): List<NDIDevice> {
         try {
             val devicesData = getNDIDevicesAndSources()
-            Log.d("MainActivity", "Got ${devicesData.size} devices from NDI")
 
             return devicesData.map { deviceData ->
                 val parts = deviceData.split("|||")
                 if (parts.isEmpty()) {
-                    Log.w("MainActivity", "Empty device data")
                     return@map NDIDevice("Unknown", emptyList())
                 }
 
                 val deviceName = parts[0]
-                val sources = parts.drop(1) // All parts after device name are sources
-
-                Log.d("MainActivity", "Device: $deviceName with ${sources.size} sources")
-                sources.forEachIndexed { index, source ->
-                    Log.d("MainActivity", "  Source $index: $source")
-                }
+                val sources = parts.drop(1)
 
                 NDIDevice(deviceName, sources)
             }
@@ -98,7 +119,7 @@ class MainActivity : ComponentActivity() {
         try {
             multicastLock?.let { lock -> if (lock.isHeld) lock.release() }
         } catch (e: Exception) {
-            Log.w("MainActivity", "Gagal melepas multicast lock", e)
+            Log.w("MainActivity", "Failed to release multicast lock", e)
         }
     }
 
