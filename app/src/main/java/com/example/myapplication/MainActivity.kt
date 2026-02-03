@@ -20,7 +20,8 @@ import kotlinx.coroutines.launch
 
 data class NDIDevice(
     val deviceName: String,
-    val sources: List<String>
+    val sources: List<String>,
+    val lastSeen: Long = System.currentTimeMillis() // Timestamp untuk tracking
 )
 
 class MainActivity : ComponentActivity() {
@@ -87,20 +88,55 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Mengambil daftar devices dan sources dari NDI SDK
+     * Fungsi ini dipanggil secara berkala untuk mendapatkan update terkini
+     * NDI SDK akan otomatis menghapus device yang sudah offline dari list
+     */
     private fun getDevicesAndSources(): List<NDIDevice> {
         try {
+            // Ambil data langsung dari NDI SDK
+            // NDI SDK sudah menangani timeout dan penghapusan device offline
             val devicesData = getNDIDevicesAndSources()
 
-            return devicesData.map { deviceData ->
-                val parts = deviceData.split("|||")
-                if (parts.isEmpty()) {
-                    return@map NDIDevice("Unknown", emptyList())
+            val currentTime = System.currentTimeMillis()
+
+            return devicesData.mapNotNull { deviceData ->
+                try {
+                    val parts = deviceData.split("|||")
+                    if (parts.isEmpty()) {
+                        Log.w("MainActivity", "Empty device data received")
+                        return@mapNotNull null
+                    }
+
+                    val deviceName = parts[0]
+                    val sources = parts.drop(1)
+
+                    // Filter: hanya device dengan source yang valid
+                    if (deviceName.isBlank() || sources.isEmpty()) {
+                        Log.d("MainActivity", "Skipping device with no valid sources: $deviceName")
+                        return@mapNotNull null
+                    }
+
+                    NDIDevice(
+                        deviceName = deviceName,
+                        sources = sources,
+                        lastSeen = currentTime
+                    )
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Error parsing device data: $deviceData", e)
+                    null
                 }
-
-                val deviceName = parts[0]
-                val sources = parts.drop(1)
-
-                NDIDevice(deviceName, sources)
+            }.also { devices ->
+                // Log untuk debugging
+                if (devices.isNotEmpty()) {
+                    Log.d("MainActivity", "Found ${devices.size} active devices:")
+                    devices.forEach { device ->
+                        Log.d("MainActivity", "  - ${device.deviceName} (${device.sources.size} sources)")
+                    }
+                } else {
+                    Log.d("MainActivity", "No active devices found")
+                }
             }
         } catch (e: Exception) {
             Log.e("MainActivity", "Error getting NDI devices", e)

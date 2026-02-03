@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 
 static const char* TAG = "NDIReceiver";
 
@@ -23,7 +24,7 @@ static std::atomic<bool> g_discoveryRunning(false);
 static std::mutex g_mutex;
 static bool g_ndi_initialized = false;
 
-// Cache for fast access
+// Cache untuk fast access dan tracking device lifecycle
 static std::map<std::string, std::vector<std::string>> g_cachedDevices;
 static std::mutex g_cacheMutex;
 static std::atomic<uint32_t> g_cachedSourceCount(0);
@@ -49,7 +50,18 @@ static NDIlib_recv_bandwidth_e getBandwidthForQuality(int quality) {
     }
 }
 
-// Background discovery thread for continuous scanning
+/**
+ * CONTINUOUS DISCOVERY THREAD
+ *
+ * Thread ini berjalan di background untuk terus-menerus:
+ * 1. Mendengarkan broadcast NDI dari network (mDNS/UDP)
+ * 2. Menerima heartbeat dari setiap NDI source yang aktif
+ * 3. Update cache dengan source yang masih hidup
+ * 4. Otomatis menghapus source yang timeout (tidak ada heartbeat)
+ *
+ * NDI SDK menangani semua mekanisme timeout secara internal,
+ * kita hanya perlu sync cache dengan hasil dari NDI Finder.
+ */
 static void continuousDiscoveryThread() {
     __android_log_print(ANDROID_LOG_INFO, TAG, "Continuous discovery thread started");
 
@@ -59,49 +71,72 @@ static void continuousDiscoveryThread() {
             continue;
         }
 
-        // Very short wait for ultra-fast updates
+        // Wait for sources dengan timeout singkat (50ms)
+        // Ini membuat discovery sangat responsif
         NDIlib_find_wait_for_sources(g_pNDI_find, 50);
 
         uint32_t no_sources = 0;
         const NDIlib_source_t* p_sources = NDIlib_find_get_current_sources(g_pNDI_find, &no_sources);
 
-        if (p_sources && no_sources > 0) {
+        /**
+         * CRITICAL: NDIlib_find_get_current_sources() hanya mengembalikan
+         * source yang MASIH AKTIF (masih mengirim heartbeat).
+         *
+         * Source yang offline/timeout TIDAK akan ada di list ini.
+         * Inilah cara NDI SDK menangani device offline secara otomatis.
+         */
+
+        {
             std::lock_guard<std::mutex> lock(g_cacheMutex);
+
+            // Clear cache lama - ini akan menghapus device yang offline
             g_cachedDevices.clear();
 
-            for (uint32_t i = 0; i < no_sources; i++) {
-                std::string fullName = p_sources[i].p_ndi_name ? p_sources[i].p_ndi_name : "";
+            // Rebuild cache hanya dengan device yang masih aktif
+            if (p_sources && no_sources > 0) {
+                for (uint32_t i = 0; i < no_sources; i++) {
+                    std::string fullName = p_sources[i].p_ndi_name ? p_sources[i].p_ndi_name : "";
 
-                std::string deviceName;
-                size_t openParen = fullName.find('(');
-                size_t closeParen = fullName.find(')');
+                    // Parse device name dari full name
+                    std::string deviceName;
+                    size_t openParen = fullName.find('(');
+                    size_t closeParen = fullName.find(')');
 
-                if (openParen != std::string::npos && closeParen != std::string::npos && closeParen > openParen) {
-                    deviceName = fullName.substr(0, openParen);
-                    while (!deviceName.empty() && deviceName.back() == ' ') {
-                        deviceName.pop_back();
+                    if (openParen != std::string::npos && closeParen != std::string::npos && closeParen > openParen) {
+                        deviceName = fullName.substr(0, openParen);
+                        // Trim trailing spaces
+                        while (!deviceName.empty() && deviceName.back() == ' ') {
+                            deviceName.pop_back();
+                        }
+                    } else {
+                        deviceName = fullName;
                     }
-                } else {
-                    deviceName = fullName;
+
+                    if (deviceName.empty()) {
+                        deviceName = "Unknown Device";
+                    }
+
+                    // Add source ke device
+                    g_cachedDevices[deviceName].push_back(fullName);
                 }
 
-                if (deviceName.empty()) {
-                    deviceName = "Unknown Device";
-                }
+                g_cachedSourceCount = no_sources;
 
-                g_cachedDevices[deviceName].push_back(fullName);
-            }
-
-            g_cachedSourceCount = no_sources;
-
-            if (no_sources > 0) {
                 __android_log_print(ANDROID_LOG_DEBUG, TAG,
-                    "Cache updated: %d sources, %zu devices",
+                    "Cache updated: %d active sources, %zu devices",
                     no_sources, g_cachedDevices.size());
+            } else {
+                // Tidak ada source aktif
+                g_cachedSourceCount = 0;
+                __android_log_print(ANDROID_LOG_DEBUG, TAG, "No active NDI sources found");
             }
         }
 
-        // Ultra-fast refresh rate for instant detection
+        /**
+         * Refresh rate: 50ms = 20 updates per second
+         * Ini cukup cepat untuk mendeteksi device offline dalam waktu singkat
+         * sambil tidak terlalu membebani CPU
+         */
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -116,6 +151,10 @@ Java_com_example_myapplication_MainActivity_stringFromJNI(
     return env->NewStringUTF(hello.c_str());
 }
 
+/**
+ * Initialize NDI Finder
+ * Harus dipanggil sebelum discovery dimulai
+ */
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_myapplication_MainActivity_initializeNDIFinder(
         JNIEnv* env,
@@ -125,6 +164,7 @@ Java_com_example_myapplication_MainActivity_initializeNDIFinder(
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // Initialize NDI library (once)
     if (!g_ndi_initialized) {
         if (!NDIlib_initialize()) {
             __android_log_print(ANDROID_LOG_ERROR, TAG, "NDIlib_initialize failed");
@@ -134,6 +174,7 @@ Java_com_example_myapplication_MainActivity_initializeNDIFinder(
         __android_log_print(ANDROID_LOG_INFO, TAG, "NDI library initialized successfully");
     }
 
+    // Create NDI finder (once)
     if (!g_pNDI_find) {
         NDIlib_find_create_t find_create;
         find_create.show_local_sources = true;
@@ -151,6 +192,10 @@ Java_com_example_myapplication_MainActivity_initializeNDIFinder(
     return JNI_TRUE;
 }
 
+/**
+ * Start continuous discovery
+ * Memulai background thread untuk monitoring NDI sources
+ */
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_myapplication_MainActivity_startContinuousDiscovery(
         JNIEnv* env,
@@ -174,6 +219,16 @@ Java_com_example_myapplication_MainActivity_startContinuousDiscovery(
     __android_log_print(ANDROID_LOG_INFO, TAG, "Continuous discovery thread launched");
 }
 
+/**
+ * Get NDI Devices and Sources
+ *
+ * Fungsi ini dipanggil secara berkala dari Kotlin layer untuk mendapatkan
+ * list device yang masih aktif. Cache sudah di-update oleh discovery thread,
+ * jadi fungsi ini hanya return dari cache untuk akses yang sangat cepat.
+ *
+ * Device yang offline TIDAK akan ada di cache karena sudah dihapus oleh
+ * discovery thread saat NDI SDK tidak lagi mengembalikan source tersebut.
+ */
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_com_example_myapplication_MainActivity_getNDIDevicesAndSources(
         JNIEnv* env,
@@ -194,6 +249,7 @@ Java_com_example_myapplication_MainActivity_getNDIDevicesAndSources(
 
     int deviceIndex = 0;
     for (const auto& entry : g_cachedDevices) {
+        // Format: "DeviceName|||Source1|||Source2|||..."
         std::string deviceData = entry.first;
 
         for (const auto& source : entry.second) {
@@ -203,122 +259,100 @@ Java_com_example_myapplication_MainActivity_getNDIDevicesAndSources(
         jstring jDeviceData = env->NewStringUTF(deviceData.c_str());
         env->SetObjectArrayElement(result, deviceIndex, jDeviceData);
         env->DeleteLocalRef(jDeviceData);
-
         deviceIndex++;
     }
 
-    __android_log_print(ANDROID_LOG_DEBUG, TAG, "Returning %d devices from cache", numDevices);
     return result;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_myapplication_MainActivity_connectToNDISource(
         JNIEnv* env,
-        jobject /* this */,
+        jobject thiz,
         jstring sourceFullName,
         jobject surface,
         jint quality) {
 
     const char* sourceName = env->GetStringUTFChars(sourceFullName, nullptr);
-    __android_log_print(ANDROID_LOG_INFO, TAG, "connectToNDISource: %s, quality: %d", sourceName, quality);
+    if (!sourceName) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to get source name");
+        return JNI_FALSE;
+    }
 
-    // Stop existing receiver if running
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_isRunning) {
-            __android_log_print(ANDROID_LOG_INFO, TAG, "Stopping existing receiver");
-            g_isRunning = false;
-            if (g_receiverThread.joinable()) {
-                g_receiverThread.join();
-            }
-            if (g_pNDI_recv) {
-                NDIlib_recv_destroy(g_pNDI_recv);
-                g_pNDI_recv = nullptr;
-            }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "Connecting to source: %s with quality: %d", sourceName, quality);
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // Stop existing receiver if any
+    if (g_isRunning) {
+        g_isRunning = false;
+        if (g_receiverThread.joinable()) {
+            g_receiverThread.join();
+        }
+        if (g_pNDI_recv) {
+            NDIlib_recv_destroy(g_pNDI_recv);
+            g_pNDI_recv = nullptr;
         }
     }
 
-    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    if (!window) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to get ANativeWindow");
+    if (!g_pNDI_find) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "NDI finder not initialized");
         env->ReleaseStringUTFChars(sourceFullName, sourceName);
         return JNI_FALSE;
     }
 
-    if (!g_ndi_initialized) {
-        if (!NDIlib_initialize()) {
-            __android_log_print(ANDROID_LOG_ERROR, TAG, "NDI not initialized");
-            ANativeWindow_release(window);
-            env->ReleaseStringUTFChars(sourceFullName, sourceName);
-            return JNI_FALSE;
-        }
-        g_ndi_initialized = true;
-    }
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_pNDI_find) {
-        NDIlib_find_create_t find_create;
-        find_create.show_local_sources = true;
-        find_create.p_groups = nullptr;
-        find_create.p_extra_ips = nullptr;
-
-        g_pNDI_find = NDIlib_find_create_v2(&find_create);
-        if (!g_pNDI_find) {
-            __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create finder");
-            ANativeWindow_release(window);
-            env->ReleaseStringUTFChars(sourceFullName, sourceName);
-            return JNI_FALSE;
-        }
-    }
-
-    // Quick search with short timeout since we have continuous discovery
-    NDIlib_find_wait_for_sources(g_pNDI_find, 500);
+    // Find the specific source
+    NDIlib_find_wait_for_sources(g_pNDI_find, 1000);
     uint32_t no_sources = 0;
     const NDIlib_source_t* p_sources = NDIlib_find_get_current_sources(g_pNDI_find, &no_sources);
 
-    const NDIlib_source_t* target_source = nullptr;
+    bool sourceFound = false;
+    NDIlib_source_t selectedSource;
+
     for (uint32_t i = 0; i < no_sources; i++) {
         if (strcmp(p_sources[i].p_ndi_name, sourceName) == 0) {
-            target_source = &p_sources[i];
-            __android_log_print(ANDROID_LOG_INFO, TAG, "Found target source");
+            selectedSource = p_sources[i];
+            sourceFound = true;
             break;
         }
     }
 
-    env->ReleaseStringUTFChars(sourceFullName, sourceName);
-
-    if (!target_source) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Source not found");
-        ANativeWindow_release(window);
+    if (!sourceFound) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Source not found: %s", sourceName);
+        env->ReleaseStringUTFChars(sourceFullName, sourceName);
         return JNI_FALSE;
     }
 
+    // Create receiver with specified quality/bandwidth
     NDIlib_recv_create_v3_t recv_create;
-    recv_create.source_to_connect_to = *target_source;
-    recv_create.color_format = NDIlib_recv_color_format_BGRX_BGRA;
-    recv_create.bandwidth = getBandwidthForQuality((int)quality);
+    recv_create.source_to_connect_to = selectedSource;
+    recv_create.color_format = NDIlib_recv_color_format_fastest;
+    recv_create.bandwidth = getBandwidthForQuality(quality);
     recv_create.allow_video_fields = false;
     recv_create.p_ndi_recv_name = "Android NDI Monitor";
 
-    __android_log_print(ANDROID_LOG_INFO, TAG, "Creating receiver with bandwidth: %d for %dp",
-                       recv_create.bandwidth, quality);
-
     g_pNDI_recv = NDIlib_recv_create_v3(&recv_create);
     if (!g_pNDI_recv) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create receiver");
-        ANativeWindow_release(window);
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to create NDI receiver");
+        env->ReleaseStringUTFChars(sourceFullName, sourceName);
         return JNI_FALSE;
     }
 
-    // Set tally
-    NDIlib_tally_t tally;
-    tally.on_program = true;
-    tally.on_preview = false;
-    NDIlib_recv_set_tally(g_pNDI_recv, &tally);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "NDI receiver created successfully");
+    env->ReleaseStringUTFChars(sourceFullName, sourceName);
 
-    __android_log_print(ANDROID_LOG_INFO, TAG, "Starting receiver thread");
-
+    // Start receiver thread
     g_isRunning = true;
+    if (g_receiverThread.joinable()) {
+        g_receiverThread.join();
+    }
+
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (!window) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "Failed to get native window");
+        return JNI_FALSE;
+    }
+
     g_receiverThread = std::thread([window]() {
         __android_log_print(ANDROID_LOG_INFO, TAG, "Receiver thread started");
 
@@ -500,12 +534,11 @@ Java_com_example_myapplication_MainActivity_stopNDIReceiver(
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    // Stop receiver
     g_isRunning = false;
-
     if (g_receiverThread.joinable()) {
         g_receiverThread.join();
     }
-
     if (g_pNDI_recv) {
         NDIlib_recv_destroy(g_pNDI_recv);
         g_pNDI_recv = nullptr;
@@ -517,10 +550,17 @@ Java_com_example_myapplication_MainActivity_stopNDIReceiver(
         g_discoveryThread.join();
     }
 
-    // Clean up finder on app close
+    // Clean up finder
     if (g_pNDI_find) {
         NDIlib_find_destroy(g_pNDI_find);
         g_pNDI_find = nullptr;
+    }
+
+    // Clear cache
+    {
+        std::lock_guard<std::mutex> cacheLock(g_cacheMutex);
+        g_cachedDevices.clear();
+        g_cachedSourceCount = 0;
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "NDI cleanup completed");
