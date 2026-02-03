@@ -70,14 +70,18 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        val initialDarkMode = intent.getBooleanExtra("isDarkMode", false)
-
         setContent {
-            var isDarkMode by remember { mutableStateOf(initialDarkMode) }
+            // Load dark mode dari preferences (auto-detect sistem atau user preference)
+            var isDarkMode by remember { mutableStateOf(ThemePreferences.isDarkMode(this)) }
+
             MyApplicationTheme {
                 NDIMonitorScreen(
                     isDarkMode = isDarkMode,
-                    onToggleTheme = { isDarkMode = !isDarkMode },
+                    onToggleTheme = {
+                        isDarkMode = !isDarkMode
+                        // Simpan preferensi user
+                        ThemePreferences.saveDarkMode(this, isDarkMode)
+                    },
                     onBack = { finish() },
                     onGetDevices = { getDevicesAndSources() },
                     onConnectToSource = { sourceName, surface, quality ->

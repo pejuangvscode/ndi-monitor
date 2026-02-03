@@ -46,7 +46,6 @@ import kotlinx.coroutines.*
 
 private const val TAG = "NDIScreen"
 private const val CONTROLS_HIDE_DELAY = 3000L
-private const val DEVICE_POLL_INTERVAL = 500L // Polling setiap 500ms untuk update cepat
 
 @Composable
 fun NDIMonitorScreen(
@@ -62,6 +61,7 @@ fun NDIMonitorScreen(
 
     var deviceList by remember { mutableStateOf<List<NDIDevice>>(emptyList()) }
     var isScanning by remember { mutableStateOf(true) }
+    var previousDeviceNames by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isManualRefreshing by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
@@ -72,79 +72,57 @@ fun NDIMonitorScreen(
         }
     }
 
-    /**
-     * MEKANISME POLLING BERKALA UNTUK DETEKSI DEVICE OFFLINE
-     *
-     * Cara kerja:
-     * 1. Polling dilakukan setiap 500ms (bisa disesuaikan)
-     * 2. Setiap polling, kita panggil onGetDevices() yang mengambil data dari NDI SDK
-     * 3. NDI SDK sudah menangani:
-     *    - Discovery melalui mDNS/UDP broadcast
-     *    - Heartbeat monitoring dari setiap source
-     *    - Timeout detection (±2-5 detik)
-     *    - Automatic removal dari internal list
-     * 4. Kita hanya perlu sinkronisasi list kita dengan list dari NDI SDK
-     * 5. Device yang offline otomatis tidak ada di list hasil NDI SDK
-     * 6. UI otomatis update karena deviceList berubah
-     */
+    // ULTRA-FAST continuous scanning dengan auto-remove inactive devices
     LaunchedEffect(Unit) {
-        while (isActive) {
-            try {
-                // Ambil list device terbaru dari NDI SDK
-                val freshDevices = withContext(Dispatchers.IO) {
-                    onGetDevices()
-                }
+        while(isActive) {
+            val result = withContext(Dispatchers.IO) { onGetDevices() }
 
-                // Filter hanya device yang masih aktif (memiliki sources)
-                val activeDevices = freshDevices.filter { device ->
-                    device.sources.isNotEmpty()
-                }
+            // Filter hanya device yang masih aktif
+            val activeDeviceNames = result.map { it.deviceName }.toSet()
 
-                // Update deviceList HANYA jika ada perubahan
-                // Ini mencegah recomposition yang tidak perlu
-                if (activeDevices != deviceList) {
-                    deviceList = activeDevices
-
-                    // Update status scanning
-                    isScanning = activeDevices.isEmpty()
-
-                    // Log perubahan untuk debugging
-                    android.util.Log.d(TAG, "Device list updated: ${activeDevices.size} active devices")
-                }
-
-            } catch (e: Exception) {
-                android.util.Log.e(TAG, "Error during device polling", e)
+            // Update device list - hapus yang tidak aktif lagi
+            val filteredDevices = result.filter { device ->
+                device.sources.isNotEmpty() // Hanya tampilkan device dengan source aktif
             }
 
-            // Delay sebelum polling berikutnya
-            // 500ms = cukup cepat untuk deteksi offline, tidak terlalu membebani CPU
-            delay(DEVICE_POLL_INTERVAL)
+            // Selalu update deviceList jika ada perubahan
+            if (filteredDevices != deviceList) {
+                deviceList = filteredDevices
+
+                // Update isScanning based on device availability
+                if (filteredDevices.isNotEmpty()) {
+                    isScanning = false
+                } else {
+                    // Jika devices kosong, kembali ke scanning mode
+                    isScanning = true
+                }
+            }
+
+            previousDeviceNames = activeDeviceNames
+
+            // SUPER AGGRESSIVE scanning untuk instant detection device offline
+            // Scan setiap 200ms = 5 scans per second untuk deteksi cepat
+            delay(200L)
         }
     }
 
-    /**
-     * Manual refresh function
-     * Dipanggil ketika user menekan tombol refresh
-     */
+    // Function untuk manual refresh
     fun manualRefresh() {
         coroutineScope.launch {
             isManualRefreshing = true
             isScanning = true
 
-            try {
-                // Force immediate scan
-                val result = withContext(Dispatchers.IO) { onGetDevices() }
-                deviceList = result.filter { device ->
-                    device.sources.isNotEmpty()
-                }
-
-                // Update scanning status
-                isScanning = deviceList.isEmpty()
-
-                android.util.Log.d(TAG, "Manual refresh completed: ${deviceList.size} devices found")
-            } catch (e: Exception) {
-                android.util.Log.e(TAG, "Error during manual refresh", e)
+            // Force immediate scan
+            val result = withContext(Dispatchers.IO) { onGetDevices() }
+            deviceList = result.filter { device ->
+                device.sources.isNotEmpty()
             }
+
+            // Tetap scanning jika tidak ada devices
+            if (deviceList.isNotEmpty()) {
+                isScanning = false
+            }
+            // Jika deviceList kosong, isScanning tetap true
 
             delay(500) // Small delay for user feedback
             isManualRefreshing = false
@@ -357,7 +335,7 @@ fun NDIMonitorScreen(
         }
 
         AnimatedVisibility(visible = showControls, enter = fadeIn(), exit = fadeOut()) {
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
                 IconButton(
                     onClick = onBack,
                     modifier = Modifier.align(Alignment.TopStart).padding(24.dp).size(48.dp)
@@ -371,316 +349,361 @@ fun NDIMonitorScreen(
                         .padding(24.dp)
                 ) {
                     IconButton(
-                        onClick = { showSettingsDialog = true },
+                        onClick = {
+                            showControls = true
+                            showSettingsDialog = true
+                        },
                         modifier = Modifier.size(48.dp)
                     ) {
-                        Icon(Icons.Default.Menu, "Settings", tint = Color.White, modifier = Modifier.size(32.dp))
+                        Icon(Icons.Default.Menu, "Menu", tint = Color.White, modifier = Modifier.size(32.dp))
+                    }
+
+                    if (deviceList.isNotEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .offset(x = 4.dp, y = (-4).dp)
+                                .size(20.dp)
+                                .background(Color.Red, RoundedCornerShape(10.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = deviceList.size.toString(),
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = poppinsFontFamily
+                            )
+                        }
                     }
                 }
             }
         }
     }
 
-    // Settings Dialog
     if (showSettingsDialog) {
-        Dialog(
-            onDismissRequest = { showSettingsDialog = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
+        SettingsDialog(
+            isDarkMode = isDarkMode,
+            deviceList = deviceList,
+            selectedQuality = selectedQuality,
+            isConnecting = isConnecting,
+            isScanning = isScanning,
+            currentSourceName = currentSourceName,
+            isManualRefreshing = isManualRefreshing,
+            onDeviceSelected = { device ->
+                selectedDevice = device
+                showSourceDialog = true
+            },
+            onQualityChange = { quality ->
+                isQualityChanging = true
+                selectedQuality = quality
+
+                surfaceRef?.let { surface ->
+                    val currentSource = currentSourceName
+                    if (currentSource != "No Source Selected") {
+                        coroutineScope.launch(Dispatchers.IO) {
+                            try {
+                                val qualityInt = quality.toIntOrNull() ?: 720
+                                onConnectToSource(currentSource, surface, qualityInt)
+                                delay(300)
+                                withContext(Dispatchers.Main) {
+                                    isQualityChanging = false
+                                }
+                            } catch (e: Exception) {
+                                withContext(Dispatchers.Main) {
+                                    isQualityChanging = false
+                                }
+                            }
+                        }
+                    } else {
+                        isQualityChanging = false
+                    }
+                }
+            },
+            onRefresh = { manualRefresh() },
+            onDismiss = { showSettingsDialog = false }
+        )
+    }
+
+    if (showSourceDialog && selectedDevice != null) {
+        SourceListDialog(
+            isDarkMode = isDarkMode,
+            device = selectedDevice!!,
+            currentSourceName = currentSourceName,
+            onSourceSelected = { source ->
+                currentSourceName = source
+                isConnecting = true
+                showSourceDialog = false
+                showSettingsDialog = false
+
+                surfaceRef?.let { surface ->
+                    coroutineScope.launch(Dispatchers.IO) {
+                        try {
+                            val qualityInt = selectedQuality.toIntOrNull() ?: 720
+                            val connected = onConnectToSource(source, surface, qualityInt)
+                            delay(500)
+                            withContext(Dispatchers.Main) {
+                                isConnecting = false
+                            }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                isConnecting = false
+                            }
+                        }
+                    }
+                }
+            },
+            onBack = { showSourceDialog = false },
+            onDismiss = { showSourceDialog = false }
+        )
+    }
+}
+
+@Composable
+fun SettingsDialog(
+    isDarkMode: Boolean,
+    deviceList: List<NDIDevice>,
+    selectedQuality: String,
+    isConnecting: Boolean,
+    isScanning: Boolean,
+    currentSourceName: String,
+    isManualRefreshing: Boolean,
+    onDeviceSelected: (NDIDevice) -> Unit,
+    onQualityChange: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isDarkMode) Color(0xFF1E1E1E) else Color.White
+            ),
+            modifier = Modifier
+                .widthIn(max = 500.dp)
+                .fillMaxWidth(0.9f)
+                .wrapContentHeight()
+                .padding(vertical = 24.dp)
         ) {
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isDarkMode) Color(0xFF1E1E1E) else Color.White
-                ),
-                modifier = Modifier
-                    .widthIn(max = 450.dp)
-                    .fillMaxWidth(0.9f)
-                    .wrapContentHeight()
-            ) {
-                Column {
-                    // Header
+            Column {
+                // Header (fixed, tidak ikut scroll)
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Settings",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isDarkMode) Color.White else Color.Black,
+                        fontFamily = poppinsFontFamily
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, null, tint = if (isDarkMode) Color.White else Color.Black)
+                    }
+                }
+
+                HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+
+                // Scrollable content
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .heightIn(max = 600.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    // Available Devices Section
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(16.dp),
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "NDI Settings",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
+                            "Available Devices",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
                             color = if (isDarkMode) Color.White else Color.Black,
                             fontFamily = poppinsFontFamily
                         )
-                        IconButton(onClick = { showSettingsDialog = false }) {
-                            Icon(
-                                Icons.Default.Close,
-                                "Close",
-                                tint = if (isDarkMode) Color.White else Color.Black
-                            )
+
+                        // Refresh Button
+                        IconButton(
+                            onClick = { onRefresh() },
+                            enabled = !isManualRefreshing,
+                            modifier = Modifier
+                                .size(36.dp)
+                        ) {
+                            if (isManualRefreshing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp,
+                                    color = if (isDarkMode) Color.White else Color.Black
+                                )
+                            } else {
+                                Icon(
+                                    Icons.Default.Refresh,
+                                    contentDescription = "Refresh Devices",
+                                    tint = if (isDarkMode) Color.White else Color.Black,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
                     }
 
-                    HorizontalDivider()
-
-                    // Scrollable content
-                    Column(
+                    Box(
                         modifier = Modifier
-                            .weight(1f, fill = false)
-                            .heightIn(max = 600.dp)
-                            .verticalScroll(rememberScrollState())
+                            .fillMaxWidth()
+                            .heightIn(min = 150.dp, max = 300.dp)
+                            .padding(horizontal = 16.dp)
                     ) {
-                        // Available Devices Section
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                "Available Devices",
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (isDarkMode) Color.White else Color.Black,
-                                fontFamily = poppinsFontFamily
-                            )
-
-                            // Refresh Button
-                            IconButton(
-                                onClick = { manualRefresh() },
-                                enabled = !isManualRefreshing,
-                                modifier = Modifier.size(36.dp)
+                        if (deviceList.isEmpty()) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(vertical = 24.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
                             ) {
-                                if (isManualRefreshing) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(20.dp),
-                                        strokeWidth = 2.dp,
-                                        color = if (isDarkMode) Color.White else Color.Black
-                                    )
-                                } else {
-                                    Icon(
-                                        Icons.Default.Refresh,
-                                        contentDescription = "Refresh Devices",
-                                        tint = if (isDarkMode) Color.White else Color.Black,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(40.dp),
+                                    color = if (isDarkMode) Color.White else Color.Black
+                                )
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    "Searching for devices...",
+                                    color = Color.Gray,
+                                    fontSize = 13.sp,
+                                    fontFamily = poppinsFontFamily
+                                )
+                                Text(
+                                    "Ensure devices are on the same network",
+                                    color = Color.Gray.copy(alpha = 0.7f),
+                                    fontSize = 11.sp,
+                                    fontFamily = poppinsFontFamily
+                                )
                             }
-                        }
+                        } else {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                deviceList.forEach { device ->
+                                    // Cek apakah device ini sedang terhubung
+                                    val isConnected = device.sources.any { source ->
+                                        currentSourceName.contains(device.deviceName)
+                                    }
 
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 150.dp, max = 300.dp)
-                                .padding(horizontal = 16.dp)
-                        ) {
-                            if (deviceList.isEmpty()) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(vertical = 24.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.Center
-                                ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(40.dp),
-                                        color = if (isDarkMode) Color.White else Color.Black
-                                    )
-                                    Spacer(modifier = Modifier.height(16.dp))
-                                    Text(
-                                        "Searching for devices...",
-                                        color = Color.Gray,
-                                        fontSize = 13.sp,
-                                        fontFamily = poppinsFontFamily
-                                    )
-                                    Text(
-                                        "Ensure devices are on the same network",
-                                        color = Color.Gray.copy(alpha = 0.7f),
-                                        fontSize = 11.sp,
-                                        fontFamily = poppinsFontFamily
-                                    )
-                                }
-                            } else {
-                                Column(
-                                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    deviceList.forEach { device ->
-                                        // Cek apakah device ini sedang terhubung
-                                        val isConnected = device.sources.any { source ->
-                                            currentSourceName.contains(device.deviceName)
-                                        }
-
-                                        Card(
-                                            shape = RoundedCornerShape(12.dp),
-                                            colors = CardDefaults.cardColors(
-                                                containerColor = if (isDarkMode) Color(0xFF2A2A2A) else Color(0xFFF5F5F5)
-                                            ),
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable {
-                                                    selectedDevice = device
-                                                    showSourceDialog = true
-                                                }
+                                    Card(
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = if (isDarkMode) Color(0xFF2A2A2A) else Color(0xFFF5F5F5)
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { onDeviceSelected(device) }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Row(
-                                                modifier = Modifier.padding(12.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Column(modifier = Modifier.weight(1f)) {
-                                                    Text(
-                                                        device.deviceName,
-                                                        fontSize = 14.sp,
-                                                        fontWeight = FontWeight.Medium,
-                                                        color = if (isDarkMode) Color.White else Color.Black,
-                                                        fontFamily = poppinsFontFamily
-                                                    )
-                                                    Text(
-                                                        "${device.sources.size} source(s)",
-                                                        fontSize = 12.sp,
-                                                        color = Color.Gray,
-                                                        fontFamily = poppinsFontFamily
-                                                    )
-                                                }
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    device.deviceName,
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    color = if (isDarkMode) Color.White else Color.Black,
+                                                    fontFamily = poppinsFontFamily
+                                                )
+                                                Text(
+                                                    "${device.sources.size} source(s)",
+                                                    fontSize = 12.sp,
+                                                    color = Color.Gray,
+                                                    fontFamily = poppinsFontFamily
+                                                )
+                                            }
 
-                                                // Icon centang jika device terhubung
-                                                if (isConnected) {
-                                                    Icon(
-                                                        Icons.Default.Check,
-                                                        contentDescription = "Connected",
-                                                        tint = Color(0xFF4CAF50),
-                                                        modifier = Modifier.size(24.dp)
-                                                    )
-                                                } else {
-                                                    Icon(
-                                                        Icons.Default.ArrowBack,
-                                                        null,
-                                                        tint = Color.Gray,
-                                                        modifier = Modifier.size(16.dp).graphicsLayer(rotationZ = 180f)
-                                                    )
-                                                }
+                                            // Icon centang jika device terhubung
+                                            if (isConnected) {
+                                                Icon(
+                                                    Icons.Default.Check,
+                                                    contentDescription = "Connected",
+                                                    tint = Color(0xFF4CAF50),
+                                                    modifier = Modifier.size(24.dp)
+                                                )
+                                            } else {
+                                                Icon(
+                                                    Icons.Default.ArrowBack,
+                                                    null,
+                                                    tint = Color.Gray,
+                                                    modifier = Modifier.size(16.dp).graphicsLayer(rotationZ = 180f)
+                                                )
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-
-                        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-
-                        // Stream Quality Section
-                        Text(
-                            "Stream Quality",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (isDarkMode) Color.White else Color.Black,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                            fontFamily = poppinsFontFamily
-                        )
-
-                        // Semua opsi quality: 360p, 720p, 1080p
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            listOf("360", "720", "1080").forEach { quality ->
-                                FilterChip(
-                                    selected = (quality == selectedQuality),
-                                    onClick = {
-                                        if (quality != selectedQuality) {
-                                            selectedQuality = quality
-                                            // Reconnect dengan quality baru jika ada source aktif
-                                            if (surfaceRef != null && currentSourceName != "No Source Selected") {
-                                                isQualityChanging = true
-                                                coroutineScope.launch {
-                                                    delay(100)
-                                                    val qualityInt = quality.toIntOrNull() ?: 720
-                                                    surfaceRef?.let { surface ->
-                                                        val success = onConnectToSource(
-                                                            currentSourceName,
-                                                            surface,
-                                                            qualityInt
-                                                        )
-                                                        if (success) {
-                                                            android.util.Log.d(TAG, "Quality changed to ${quality}p")
-                                                        }
-                                                    }
-                                                    isQualityChanging = false
-                                                }
-                                            }
-                                        }
-                                    },
-                                    label = {
-                                        Text(
-                                            "${quality}p",
-                                            fontSize = 13.sp,
-                                            fontWeight = if (quality == selectedQuality) FontWeight.Bold else FontWeight.Normal,
-                                            fontFamily = poppinsFontFamily
-                                        )
-                                    },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-                        }
-
-                        // Teks keterangan di bawah button
-                        Text(
-                            text = when(selectedQuality) {
-                                "360" -> "Low (640x360) - Fast, low bandwidth"
-                                "720" -> "HD (1280x720) - Balanced quality"
-                                "1080" -> "Full HD (1920x1080) - Best quality"
-                                else -> "Select quality"
-                            },
-                            fontSize = 11.sp,
-                            color = Color.Gray,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                            fontFamily = poppinsFontFamily
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
                     }
+
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+
+                    // Stream Quality Section
+                    Text(
+                        "Stream Quality",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isDarkMode) Color.White else Color.Black,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        fontFamily = poppinsFontFamily
+                    )
+
+                    // Semua opsi quality: 360p, 720p, 1080p
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        listOf("360", "720", "1080").forEach { quality ->
+                            FilterChip(
+                                selected = (quality == selectedQuality),
+                                onClick = { onQualityChange(quality) },
+                                label = {
+                                    Text(
+                                        "${quality}p",
+                                        fontSize = 13.sp,
+                                        fontWeight = if (quality == selectedQuality) FontWeight.Bold else FontWeight.Normal,
+                                        fontFamily = poppinsFontFamily
+                                    )
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    // Teks keterangan di bawah button
+                    Text(
+                        text = when(selectedQuality) {
+                            "360" -> "Low (640x360) - Fast, low bandwidth"
+                            "720" -> "HD (1280x720) - Balanced quality"
+                            "1080" -> "Full HD (1920x1080) - Best quality"
+                            else -> "Select quality"
+                        },
+                        fontSize = 11.sp,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                        fontFamily = poppinsFontFamily
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
                 }
             }
         }
-    }
-
-    // Source Selection Dialog
-    if (showSourceDialog && selectedDevice != null) {
-        SourceListDialog(
-            isDarkMode = isDarkMode,
-            device = selectedDevice!!,
-            currentSourceName = currentSourceName,
-            onSourceSelected = { sourceName ->
-                isConnecting = true
-                showSourceDialog = false
-                showSettingsDialog = false
-
-                coroutineScope.launch {
-                    delay(100)
-                    val qualityInt = selectedQuality.toIntOrNull() ?: 720
-
-                    surfaceRef?.let { surface ->
-                        val success = onConnectToSource(sourceName, surface, qualityInt)
-                        if (success) {
-                            currentSourceName = sourceName
-                            android.util.Log.d(TAG, "Connected to: $sourceName")
-                        }
-                    }
-                    isConnecting = false
-                }
-            },
-            onBack = {
-                showSourceDialog = false
-                selectedDevice = null
-            },
-            onDismiss = {
-                showSourceDialog = false
-                selectedDevice = null
-            }
-        )
     }
 }
 
@@ -709,19 +732,13 @@ fun SourceListDialog(
                 .padding(vertical = 24.dp)
         ) {
             Column(modifier = Modifier.padding(bottom = 16.dp)) {
-                // Header
+                // Header (fixed)
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = onBack) {
-                        Icon(
-                            Icons.Default.ArrowBack,
-                            null,
-                            tint = if (isDarkMode) Color.White else Color.Black
-                        )
+                        Icon(Icons.Default.ArrowBack, null, tint = if (isDarkMode) Color.White else Color.Black)
                     }
                     Column {
                         Text(
@@ -766,6 +783,7 @@ fun SourceListDialog(
                                             modifier = Modifier.weight(1f)
                                         )
 
+                                        // Icon centang jika source sedang dipilih
                                         if (isSelected) {
                                             Icon(
                                                 Icons.Default.Check,
@@ -803,11 +821,11 @@ fun NDIMonitorView(
 ) {
     // Adaptive Resolution berdasarkan quality yang dipilih
     val targetResolution = remember(quality) {
-        when (quality) {
-            "360" -> Pair(640, 360)
-            "720" -> Pair(1280, 720)
-            "1080" -> Pair(1920, 1080)
-            else -> Pair(1280, 720)
+        when(quality) {
+            "360" -> Pair(640, 360)    // Low quality
+            "720" -> Pair(1280, 720)   // HD quality
+            "1080" -> Pair(1920, 1080) // Full HD quality
+            else -> Pair(1280, 720)     // Default HD
         }
     }
 
@@ -828,11 +846,9 @@ fun NDIMonitorView(
                     onSurfaceReady(holder.surface)
                     onResolutionChanged(targetResolution.first, targetResolution.second)
                 }
-
                 override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, h2: Int) {
                     onResolutionChanged(w, h2)
                 }
-
                 override fun surfaceDestroyed(h: SurfaceHolder) {
                     (ctx as? MainActivity)?.releaseMulticastLock()
                 }

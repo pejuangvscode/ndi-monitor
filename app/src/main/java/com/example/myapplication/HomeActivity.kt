@@ -24,12 +24,17 @@ class HomeActivity : ComponentActivity() {
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
 
         setContent {
-            var isDarkMode by remember { mutableStateOf(false) }
+            // Load dark mode dari preferences (auto-detect sistem atau user preference)
+            var isDarkMode by remember { mutableStateOf(ThemePreferences.isDarkMode(this)) }
 
             MyApplicationTheme {
                 HomeScreen(
                     isDarkMode = isDarkMode,
-                    onToggleTheme = { isDarkMode = !isDarkMode },
+                    onToggleTheme = {
+                        isDarkMode = !isDarkMode
+                        // Simpan preferensi user
+                        ThemePreferences.saveDarkMode(this, isDarkMode)
+                    },
                     onStartMonitor = {
                         // Buka MainActivity saat tombol diklik
                         val intent = Intent(this@HomeActivity, MainActivity::class.java)
