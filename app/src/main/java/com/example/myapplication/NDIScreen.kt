@@ -102,7 +102,7 @@ fun NDIMonitorScreen(
 
             // SUPER AGGRESSIVE scanning untuk instant detection device offline
             // Scan setiap 200ms = 5 scans per second untuk deteksi cepat
-            delay(200L)
+            delay(50L)
         }
     }
 
