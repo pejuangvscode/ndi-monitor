@@ -3,15 +3,29 @@ package com.example.myapplication
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.runtime.*
 import com.example.myapplication.ui.theme.MyApplicationTheme
 
 class HomeActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(
+            WindowInsetsCompat.Type.statusBars() or
+                    WindowInsetsCompat.Type.navigationBars()
+        )
+
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
         setContent {
-            // Mengambil state awal dari Preferences (Sistem jika baru, atau Pilihan Terakhir)
             var isDarkMode by remember {
                 mutableStateOf(ThemePreferences.isDarkMode(this@HomeActivity))
             }
@@ -22,14 +36,24 @@ class HomeActivity : ComponentActivity() {
                     onToggleTheme = {
                         val newMode = !isDarkMode
                         isDarkMode = newMode
-                        // Simpan pilihan ke SharedPreferences secara permanen
                         ThemePreferences.saveDarkMode(this@HomeActivity, newMode)
                     },
                     onStartMonitor = {
-                        // Navigasi atau logika start monitor tetap sama
+
                     }
                 )
             }
+        }
+    }
+
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            WindowInsetsControllerCompat(window, window.decorView).hide(
+                WindowInsetsCompat.Type.statusBars() or
+                        WindowInsetsCompat.Type.navigationBars()
+            )
         }
     }
 }

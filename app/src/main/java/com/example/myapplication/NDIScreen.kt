@@ -61,74 +61,17 @@ fun NDIMonitorScreen(
 
     var deviceList by remember { mutableStateOf<List<NDIDevice>>(emptyList()) }
     var isScanning by remember { mutableStateOf(true) }
-    var previousDeviceNames by remember { mutableStateOf<Set<String>>(emptySet()) }
     var isManualRefreshing by remember { mutableStateOf(false) }
 
-    DisposableEffect(Unit) {
-        val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-        onDispose {
-            activity?.requestedOrientation = originalOrientation
-        }
-    }
+    // State untuk tracking koneksi dan auto-reset saat device hilang
+    var isConnected by remember { mutableStateOf(false) }
+    var connectedSourceName by remember { mutableStateOf<String?>(null) }
 
-    // ULTRA-FAST continuous scanning dengan auto-remove inactive devices
-    LaunchedEffect(Unit) {
-        while(isActive) {
-            val result = withContext(Dispatchers.IO) { onGetDevices() }
+    // Device cache untuk stabilitas - track terakhir terlihat
+    var deviceLastSeen by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
+    val DEVICE_TIMEOUT = 3000L // 3 detik grace period sebelum dianggap hilang
 
-            // Filter hanya device yang masih aktif
-            val activeDeviceNames = result.map { it.deviceName }.toSet()
-
-            // Update device list - hapus yang tidak aktif lagi
-            val filteredDevices = result.filter { device ->
-                device.sources.isNotEmpty() // Hanya tampilkan device dengan source aktif
-            }
-
-            // Selalu update deviceList jika ada perubahan
-            if (filteredDevices != deviceList) {
-                deviceList = filteredDevices
-
-                // Update isScanning based on device availability
-                if (filteredDevices.isNotEmpty()) {
-                    isScanning = false
-                } else {
-                    // Jika devices kosong, kembali ke scanning mode
-                    isScanning = true
-                }
-            }
-
-            previousDeviceNames = activeDeviceNames
-
-            // SUPER AGGRESSIVE scanning untuk instant detection device offline
-            // Scan setiap 200ms = 5 scans per second untuk deteksi cepat
-            delay(50L)
-        }
-    }
-
-    // Function untuk manual refresh
-    fun manualRefresh() {
-        coroutineScope.launch {
-            isManualRefreshing = true
-            isScanning = true
-
-            // Force immediate scan
-            val result = withContext(Dispatchers.IO) { onGetDevices() }
-            deviceList = result.filter { device ->
-                device.sources.isNotEmpty()
-            }
-
-            // Tetap scanning jika tidak ada devices
-            if (deviceList.isNotEmpty()) {
-                isScanning = false
-            }
-            // Jika deviceList kosong, isScanning tetap true
-
-            delay(500) // Small delay for user feedback
-            isManualRefreshing = false
-        }
-    }
-
+    // UI state variables
     var showControls by remember { mutableStateOf(true) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showSourceDialog by remember { mutableStateOf(false) }
@@ -147,6 +90,128 @@ fun NDIMonitorScreen(
     var scale by remember { mutableStateOf(1f) }
     var offsetX by remember { mutableStateOf(0f) }
     var offsetY by remember { mutableStateOf(0f) }
+
+    DisposableEffect(Unit) {
+        val originalOrientation = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        onDispose {
+            activity?.requestedOrientation = originalOrientation
+        }
+    }
+
+    // IMPROVED: Scanning sangat stabil dengan device cache dan grace period
+    LaunchedEffect(Unit) {
+        while(isActive) {
+            val currentTime = System.currentTimeMillis()
+            val result = withContext(Dispatchers.IO) { onGetDevices() }
+
+            // Update last seen time untuk setiap device yang terdeteksi
+            val updatedLastSeen = deviceLastSeen.toMutableMap()
+
+            result.forEach { device ->
+                device.sources.forEach { source ->
+                    // Track setiap source dengan timestamp
+                    updatedLastSeen[source] = currentTime
+                }
+            }
+
+            // Bersihkan device yang sudah timeout (tidak terlihat > 3 detik)
+            val validSources = updatedLastSeen.filter { (source, lastSeen) ->
+                currentTime - lastSeen < DEVICE_TIMEOUT
+            }
+
+            deviceLastSeen = validSources
+
+            // Build device list dari cache (bukan langsung dari result)
+            // Ini membuat deteksi lebih stabil - device tidak langsung hilang jika sesaat tidak terdeteksi
+            val stableDevices = result.mapNotNull { device ->
+                val activeSources = device.sources.filter { source ->
+                    validSources.containsKey(source)
+                }
+
+                if (activeSources.isNotEmpty()) {
+                    NDIDevice(
+                        deviceName = device.deviceName,
+                        sources = activeSources,
+                        lastSeen = device.lastSeen
+                    )
+                } else null
+            }
+
+            // CRITICAL: Cek apakah device yang sedang terkoneksi masih ada
+            if (isConnected && connectedSourceName != null) {
+                val connectedSourceStillActive = validSources.containsKey(connectedSourceName)
+
+                // Jika source yang terkoneksi sudah timeout (benar-benar hilang), reset ke tampilan scanning
+                if (!connectedSourceStillActive) {
+                    isConnected = false
+                    connectedSourceName = null
+                    isScanning = true
+                    // Reset surface untuk kembali ke tampilan hitam
+                    surfaceRef = null
+                    // Reset source name ke default
+                    currentSourceName = "No Source Selected"
+                }
+            }
+
+            // Update deviceList dengan stable devices
+            if (stableDevices != deviceList) {
+                deviceList = stableDevices
+
+                // Update isScanning based on device availability
+                // Hanya update jika tidak sedang terkoneksi
+                if (!isConnected) {
+                    if (stableDevices.isNotEmpty()) {
+                        isScanning = false
+                    } else {
+                        // Jika devices kosong (setelah timeout), kembali ke scanning mode
+                        isScanning = true
+                    }
+                }
+            }
+
+            // IMPROVED: Scanning interval stabil - 200ms untuk balance performa dan akurasi
+            delay(200L)
+        }
+    }
+
+    // Function untuk manual refresh
+    fun manualRefresh() {
+        coroutineScope.launch {
+            isManualRefreshing = true
+
+            // Reset cache untuk fresh scan
+            deviceLastSeen = emptyMap()
+
+            // Force immediate scan
+            val currentTime = System.currentTimeMillis()
+            val result = withContext(Dispatchers.IO) { onGetDevices() }
+
+            // Build fresh device cache
+            val freshLastSeen = mutableMapOf<String, Long>()
+            result.forEach { device ->
+                device.sources.forEach { source ->
+                    freshLastSeen[source] = currentTime
+                }
+            }
+            deviceLastSeen = freshLastSeen
+
+            deviceList = result.filter { device ->
+                device.sources.isNotEmpty()
+            }
+
+            // Tetap scanning jika tidak ada devices atau tidak terkoneksi
+            if (deviceList.isNotEmpty() && !isConnected) {
+                isScanning = false
+            } else if (deviceList.isEmpty()) {
+                isScanning = true
+            }
+            // Jika deviceList kosong, isScanning tetap true
+
+            delay(500) // Small delay for user feedback
+            isManualRefreshing = false
+        }
+    }
 
     LaunchedEffect(showControls) {
         hideControlsJob?.cancel()
@@ -266,7 +331,8 @@ fun NDIMonitorScreen(
                         }
                     }
 
-                    if (isScanning && deviceList.isEmpty()) {
+                    // Tampilkan "Scanning..." saat isScanning true (baik awal atau saat device off)
+                    if (isScanning) {
                         Row(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
@@ -441,10 +507,16 @@ fun NDIMonitorScreen(
                         try {
                             val qualityInt = selectedQuality.toIntOrNull() ?: 720
                             val connected = onConnectToSource(source, surface, qualityInt)
-                            delay(500)
+
                             withContext(Dispatchers.Main) {
+                                if (connected) {
+                                    // Mark as connected dan simpan source name
+                                    isConnected = true
+                                    connectedSourceName = source
+                                }
                                 isConnecting = false
                             }
+                            delay(500)
                         } catch (e: Exception) {
                             withContext(Dispatchers.Main) {
                                 isConnecting = false

@@ -23,10 +23,39 @@ data class NDIDevice(
 )
 
 /**
- * ULTRA-FAST NDI MANAGER
- * - Pre-warming scan untuk instant detection
- * - Persistent cache untuk instant reopen
- * - Adaptive scanning untuk optimal performance
+ * STUDIO MONITOR STYLE NDI MANAGER
+ *
+ * Mengapa Studio Monitor lebih cepat? Karena lebih "berisik" di network!
+ *
+ * COLD START (App ditutup dan dibuka lagi):
+ * ✅ INSTANT MEGA BURST: 10x native findNDISources() dalam 500ms pertama
+ *    - Setiap call = 3-phase discovery (immediate + quick burst + patient scan)
+ *    - Total: Ultra-aggressive network discovery
+ * ✅ EARLY CHECK: Cek sources setiap 50ms untuk instant detection
+ * ✅ AGGRESSIVE SCAN: Fallback 25x scan dalam 500ms berikutnya
+ * ✅ PERIODIC STIMULUS: Final 5x scan dalam 500ms terakhir
+ *
+ * Target: Detection < 2 detik (biasanya < 500ms di mega burst)
+ *
+ * HOT RESUME (App dari background):
+ * ✅ Quick scan burst (3x native findNDISources())
+ * ✅ Fast scanning
+ *
+ * Saat Studio Monitor dibuka:
+ * ✅ Membuat NDI finder aktif (native)
+ * ✅ Melakukan aggressive wait_for_sources(0) - network stimulus
+ * ✅ Mengirim burst discovery packets ke network
+ * ✅ Memicu NDI sources untuk:
+ *    • Re-announce presence
+ *    • Refresh metadata
+ *    • Re-broadcast state
+ *
+ * Implementasi:
+ * - Persistent cache untuk instant UI response
+ * - Native findNDISources() dengan 3-phase discovery
+ * - Super network stimulus saat cold start
+ * - Normal stimulus saat resume
+ * - Auto-stimulus saat resume
  */
 object NDIManager {
     private const val TAG = "NDIManager"
@@ -42,12 +71,11 @@ object NDIManager {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var lastKnownDevices: List<NDIDevice> = emptyList()
 
-    external fun initializeNDIFinder(): Boolean
-    external fun startContinuousDiscovery()
-    external fun getNDIDevicesAndSources(): Array<String>
-    external fun stopContinuousDiscovery()
-    external fun cleanupNDIFinder()
-    external fun forceImmediateScan(): Int
+    // Native function - menggunakan findNDISources dari native-lib.cpp
+    external fun findNDISources(): Array<String>
+
+    // Native cleanup function
+    external fun cleanup()
 
     init {
         try {
@@ -60,38 +88,32 @@ object NDIManager {
 
     fun initialize(application: Application) {
         if (isInitialized) {
-            Log.d(TAG, "Already initialized")
-            if (!isWarmedUp) {
-                CoroutineScope(Dispatchers.IO).launch { performWarmup() }
+            Log.d(TAG, "Already initialized - re-triggering stimulus")
+            // Re-warm up dengan aggressive stimulus
+            CoroutineScope(Dispatchers.IO).launch {
+                performImmediateSuperStimulus()
             }
             return
         }
 
         try {
-            Log.d(TAG, "=== ULTRA-FAST INIT ===")
+            Log.d(TAG, "=== STUDIO MONITOR COLD START ===")
 
-            // Restore cache (instant)
+            // Restore cache (instant untuk UI)
             restoreLastKnownDevices(application)
 
-            // Acquire multicast
+            // Acquire multicast IMMEDIATELY
             val wifi = application.getSystemService(Application.WIFI_SERVICE) as WifiManager
             acquireMulticastLock(wifi)
 
-            // Init finder
-            if (!initializeNDIFinder()) {
-                Log.e(TAG, "Init failed")
-                return
-            }
-
-            // Start discovery
-            startContinuousDiscovery()
             isInitialized = true
 
-            Log.d(TAG, "✓ Initialized")
+            Log.d(TAG, "✓ Initialized - starting SUPER STIMULUS")
 
-            // Warm-up di background
+            // IMMEDIATE SUPER AGGRESSIVE STIMULUS
+            // Seperti Studio Monitor: LANGSUNG berisik di network
             CoroutineScope(Dispatchers.IO).launch {
-                performWarmup()
+                performImmediateSuperStimulus()
             }
 
         } catch (e: Exception) {
@@ -100,27 +122,159 @@ object NDIManager {
     }
 
     /**
-     * WARM-UP: 10 aggressive scans dalam 200ms
+     * IMMEDIATE SUPER AGGRESSIVE STIMULUS
+     * Seperti Studio Monitor saat PERTAMA dibuka atau setelah ditutup
+     *
+     * Target: Detection < 2 detik (biasanya < 500ms)
+     *
+     * Strategy:
+     * 1. INSTANT MEGA BURST: 10x native findNDISources() dalam 500ms pertama
+     * 2. CHECK EARLY: Cek setiap burst untuk early exit
+     * 3. CONTINUOUS PROBE: Jika belum ketemu, lanjut aggressive scan
+     */
+    private suspend fun performImmediateSuperStimulus() {
+        Log.d(TAG, "🚀 === SUPER STIMULUS START (Cold Start) ===")
+
+        // NO DELAY - langsung berisik!
+        var found = false
+
+        // PHASE 0: INSTANT MEGA BURST (500ms)
+        // Seperti Studio Monitor: LANGSUNG banjir network dengan packets
+        Log.d(TAG, "⚡⚡⚡ INSTANT MEGA BURST - 10x native findNDISources()")
+        repeat(10) { round ->
+            // Native findNDISources() = 3-phase discovery
+            val sources = withContext(Dispatchers.IO) {
+                try {
+                    findNDISources()
+                } catch (e: Exception) {
+                    Log.e(TAG, "findNDISources error", e)
+                    emptyArray()
+                }
+            }
+
+            val count = sources.size
+            Log.d(TAG, "Super burst ${round+1}/10: $count sources")
+
+            if (count > 0) {
+                found = true
+                isWarmedUp = true
+                Log.d(TAG, "🎯 FOUND in mega burst round ${round+1}!")
+                return
+            }
+
+            delay(50)
+        }
+
+        if (!found) {
+            Log.d(TAG, "⚡ Mega burst done, continuing aggressive scan...")
+
+            // PHASE 1: Aggressive Scanning (500ms)
+            repeat(25) { i ->
+                val sources = withContext(Dispatchers.IO) {
+                    try {
+                        findNDISources()
+                    } catch (e: Exception) {
+                        emptyArray()
+                    }
+                }
+
+                val count = sources.size
+                Log.d(TAG, "Aggressive scan #${i+1}: $count sources")
+
+                if (count > 0) {
+                    found = true
+                    isWarmedUp = true
+                    Log.d(TAG, "✓ FOUND in aggressive scan!")
+                    return
+                }
+                delay(20)
+            }
+        }
+
+        if (!found) {
+            Log.d(TAG, "⚡ Continuing with periodic stimulus...")
+
+            // PHASE 2: Periodic Stimulus (500ms)
+            repeat(5) { i ->
+                val sources = withContext(Dispatchers.IO) {
+                    try {
+                        findNDISources()
+                    } catch (e: Exception) {
+                        emptyArray()
+                    }
+                }
+
+                val count = sources.size
+                Log.d(TAG, "Periodic stimulus #${i+1}: $count sources")
+
+                if (count > 0) {
+                    found = true
+                    isWarmedUp = true
+                    Log.d(TAG, "✓ FOUND in periodic stimulus!")
+                    return
+                }
+                delay(100)
+            }
+        }
+
+        isWarmedUp = true
+        if (found) {
+            Log.d(TAG, "✅ SUPER STIMULUS SUCCESS")
+        } else {
+            Log.d(TAG, "⚠️ Super stimulus complete (~1.5s) - no sources found yet (will continue monitoring)")
+        }
+    }
+
+    /**
+     * STUDIO MONITOR STYLE WARM-UP
+     * Digunakan untuk re-warm setelah pause/resume
      */
     private suspend fun performWarmup() {
         if (isWarmedUp) return
 
-        Log.d(TAG, "=== WARM-UP START ===")
+        Log.d(TAG, "=== WARM-UP (Resume Mode) ===")
         delay(50)
 
-        repeat(10) { i ->
-            val count = forceImmediateScan()
-            Log.d(TAG, "Scan #${i+1}: $count sources")
+        // Quick burst untuk resume
+        repeat(3) { i ->
+            val sources = withContext(Dispatchers.IO) {
+                try {
+                    findNDISources()
+                } catch (e: Exception) {
+                    emptyArray()
+                }
+            }
+
+            val count = sources.size
+            Log.d(TAG, "Resume stimulus #${i+1}: $count sources")
+
             if (count > 0) {
                 isWarmedUp = true
-                Log.d(TAG, "✓ SOURCES FOUND EARLY!")
+                Log.d(TAG, "✓ SOURCES FOUND on resume!")
                 return
             }
-            delay(20) // Ultra-aggressive
+
+            delay(100)
+        }
+
+        // Fallback aggressive scan
+        repeat(10) { i ->
+            val sources = withContext(Dispatchers.IO) {
+                try {
+                    findNDISources()
+                } catch (e: Exception) {
+                    emptyArray()
+                }
+            }
+
+            if (sources.isNotEmpty()) {
+                isWarmedUp = true
+                return
+            }
+            delay(20)
         }
 
         isWarmedUp = true
-        Log.d(TAG, "✓ Warm-up done")
     }
 
     fun getDevices(): List<NDIDevice> {
@@ -128,41 +282,62 @@ object NDIManager {
             return lastKnownDevices
         }
 
-        try {
-            val devicesData = getNDIDevicesAndSources()
-            val currentTime = System.currentTimeMillis()
+        return runBlocking(Dispatchers.IO) {
+            try {
+                val currentTime = System.currentTimeMillis()
 
-            val devices = devicesData.mapNotNull { deviceData ->
-                try {
-                    val parts = deviceData.split("|||")
-                    if (parts.isEmpty()) return@mapNotNull null
+                // Call native findNDISources()
+                val sourcesArray = try {
+                    findNDISources()
+                } catch (e: Exception) {
+                    Log.e(TAG, "findNDISources error", e)
+                    emptyArray()
+                }
 
-                    val deviceName = parts[0]
-                    val sources = parts.drop(1)
+                // Group sources by device name
+                val deviceMap = mutableMapOf<String, MutableList<String>>()
 
-                    if (deviceName.isBlank() || sources.isEmpty()) {
-                        return@mapNotNull null
+                sourcesArray.forEach { fullSource ->
+                    // Format: "MACHINE-NAME (Source Name)"
+                    val deviceName = if (fullSource.contains("(")) {
+                        fullSource.substringBefore("(").trim()
+                    } else {
+                        fullSource.trim()
                     }
 
-                    NDIDevice(
-                        deviceName = deviceName,
-                        sources = sources,
-                        lastSeen = currentTime
-                    )
-                } catch (e: Exception) {
-                    null
+                    if (!deviceMap.containsKey(deviceName)) {
+                        deviceMap[deviceName] = mutableListOf()
+                    }
+                    deviceMap[deviceName]?.add(fullSource)
                 }
+
+                // Convert to NDIDevice list
+                val devices = deviceMap.mapNotNull { (deviceName, sources) ->
+                    try {
+                        if (deviceName.isBlank() || sources.isEmpty()) {
+                            return@mapNotNull null
+                        }
+
+                        NDIDevice(
+                            deviceName = deviceName,
+                            sources = sources,
+                            lastSeen = currentTime
+                        )
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+
+                if (devices.isNotEmpty()) {
+                    lastKnownDevices = devices
+                }
+
+                devices
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Get error, using cache", e)
+                lastKnownDevices
             }
-
-            if (devices.isNotEmpty()) {
-                lastKnownDevices = devices
-            }
-
-            return devices
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Get error, using cache", e)
-            return lastKnownDevices
         }
     }
 
@@ -237,13 +412,26 @@ object NDIManager {
     }
 
     /**
-     * Resume - re-warm-up jika diperlukan
+     * Resume - trigger network stimulus untuk wake up sources
      */
     fun resume() {
-        Log.d(TAG, "Resume - quick scan")
-        if (isInitialized && !isWarmedUp) {
+        Log.d(TAG, "Resume - triggering network stimulus")
+        if (isInitialized) {
+            // Quick scan untuk wake up sources
             CoroutineScope(Dispatchers.IO).launch {
-                performWarmup()
+                delay(50)
+
+                // Quick scan setelah resume
+                if (!isWarmedUp) {
+                    performWarmup()
+                } else {
+                    val sources = try {
+                        findNDISources()
+                    } catch (e: Exception) {
+                        emptyArray()
+                    }
+                    Log.d(TAG, "Quick scan after resume: ${sources.size} sources")
+                }
             }
         }
     }
@@ -253,8 +441,14 @@ object NDIManager {
 
         try {
             Log.d(TAG, "Shutdown...")
-            stopContinuousDiscovery()
-            cleanupNDIFinder()
+
+            // Call native cleanup
+            try {
+                cleanup()
+            } catch (e: Exception) {
+                Log.e(TAG, "Native cleanup error", e)
+            }
+
             releaseMulticastLock()
             isInitialized = false
             isWarmedUp = false
