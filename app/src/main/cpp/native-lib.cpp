@@ -6,8 +6,39 @@
 #include <android/native_window_jni.h>
 #include <android/log.h>
 #include <cinttypes>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <cstring>
+#include <map>
+#include <chrono>
 
 static const char* TAG = "NDIReceiver";
+
+// Global state
+static std::atomic<bool> g_receiverRunning(false);
+static std::thread g_receiverThread;
+static std::mutex g_receiverMutex;
+static ANativeWindow* g_window = nullptr;
+static NDIlib_recv_instance_t g_pNDI_recv = nullptr;
+static bool g_ndi_initialized = false;
+
+// ============================================================================
+// SOURCE CACHE FOR STABLE DETECTION
+// ============================================================================
+struct SourceCacheEntry {
+    std::string name;
+    std::chrono::steady_clock::time_point lastSeen;
+    NDIlib_source_t source;
+};
+
+static std::map<std::string, SourceCacheEntry> g_sourceCache;
+static std::mutex g_sourceCacheMutex;
+static const int SOURCE_TIMEOUT_MS = 3000;  // 3 seconds grace period
+
+// Persistent NDI finder (reuse instead of recreate)
+static NDIlib_find_instance_t g_pNDI_find = nullptr;
+static std::mutex g_finderMutex;
 
 static void fourcc_to_string(uint32_t fourcc, char out[5]) {
     out[0] = (char)(fourcc & 0xFF);
@@ -17,265 +48,593 @@ static void fourcc_to_string(uint32_t fourcc, char out[5]) {
     out[4] = '\0';
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_myapplication_MainActivity_stringFromJNI(
-        JNIEnv* env,
-        jobject /* this */) {
-    std::string hello = "Hello from C++";
-    return env->NewStringUTF(hello.c_str());
+// ============================================================================
+// INITIALIZE PERSISTENT NDI FINDER
+// ============================================================================
+static bool initializePersistentFinder() {
+    std::lock_guard<std::mutex> lock(g_finderMutex);
+
+    if (g_pNDI_find != nullptr) {
+        return true;  // Already initialized
+    }
+
+    // Initialize NDI if needed
+    if (!g_ndi_initialized) {
+        if (!NDIlib_initialize()) {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ NDI init failed");
+            return false;
+        }
+        g_ndi_initialized = true;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "✓ NDI initialized");
+    }
+
+    // Create persistent finder
+    NDIlib_find_create_t find_desc;
+    find_desc.show_local_sources = true;
+    find_desc.p_groups = nullptr;
+    find_desc.p_extra_ips = nullptr;
+
+    g_pNDI_find = NDIlib_find_create_v2(&find_desc);
+
+    if (!g_pNDI_find) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Persistent finder creation failed");
+        return false;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Persistent NDI finder created");
+    return true;
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_example_myapplication_MainActivity_startNDIReceiver(
+// ============================================================================
+// UPDATE SOURCE CACHE
+// ============================================================================
+static void updateSourceCache(const NDIlib_source_t* sources, uint32_t count) {
+    std::lock_guard<std::mutex> lock(g_sourceCacheMutex);
+    auto now = std::chrono::steady_clock::now();
+
+    // Update existing sources and add new ones
+    for (uint32_t i = 0; i < count; i++) {
+        std::string sourceName(sources[i].p_ndi_name);
+
+        if (g_sourceCache.find(sourceName) != g_sourceCache.end()) {
+            // Update existing
+            g_sourceCache[sourceName].lastSeen = now;
+        } else {
+            // Add new source
+            SourceCacheEntry entry;
+            entry.name = sourceName;
+            entry.lastSeen = now;
+            entry.source = sources[i];
+            g_sourceCache[sourceName] = entry;
+
+            __android_log_print(ANDROID_LOG_INFO, TAG, "➕ New source cached: %s",
+                sourceName.c_str());
+        }
+    }
+}
+
+// ============================================================================
+// GET VALID SOURCES FROM CACHE (with timeout)
+// ============================================================================
+static std::vector<SourceCacheEntry> getValidCachedSources() {
+    std::lock_guard<std::mutex> lock(g_sourceCacheMutex);
+    std::vector<SourceCacheEntry> validSources;
+    auto now = std::chrono::steady_clock::now();
+
+    // Collect valid sources
+    for (auto it = g_sourceCache.begin(); it != g_sourceCache.end(); ) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->second.lastSeen).count();
+
+        if (elapsed < SOURCE_TIMEOUT_MS) {
+            // Source still valid
+            validSources.push_back(it->second);
+            ++it;
+        } else {
+            // Source timed out - remove from cache
+            __android_log_print(ANDROID_LOG_INFO, TAG, "⏱️ Source timeout: %s (%.1fs)",
+                it->second.name.c_str(), elapsed / 1000.0f);
+            it = g_sourceCache.erase(it);
+        }
+    }
+
+    return validSources;
+}
+
+// ============================================================================
+// STABLE NDI SOURCE DISCOVERY
+// ============================================================================
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_example_myapplication_NDIManager_findNDISources(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    // Initialize persistent finder if needed
+    if (!initializePersistentFinder()) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Finder initialization failed");
+        return env->NewObjectArray(0, env->FindClass("java/lang/String"), nullptr);
+    }
+
+    std::lock_guard<std::mutex> lock(g_finderMutex);
+
+    // Quick check for current sources (non-blocking)
+    uint32_t no_sources = 0;
+    const NDIlib_source_t* p_sources = nullptr;
+
+    // Gentle network stimulus (tidak agresif)
+    NDIlib_find_wait_for_sources(g_pNDI_find, 0);
+
+    // Get current sources
+    p_sources = NDIlib_find_get_current_sources(g_pNDI_find, &no_sources);
+
+    // Update cache with detected sources
+    if (p_sources && no_sources > 0) {
+        updateSourceCache(p_sources, no_sources);
+    }
+
+    // Get valid sources from cache (including timeout check)
+    std::vector<SourceCacheEntry> validSources = getValidCachedSources();
+
+    // Create result array from cached sources
+    jobjectArray result;
+
+    if (!validSources.empty()) {
+        result = env->NewObjectArray(validSources.size(),
+            env->FindClass("java/lang/String"), nullptr);
+
+        for (size_t i = 0; i < validSources.size(); i++) {
+            jstring jSourceName = env->NewStringUTF(validSources[i].name.c_str());
+            env->SetObjectArrayElement(result, i, jSourceName);
+            env->DeleteLocalRef(jSourceName);
+        }
+
+        // Log hanya setiap 20 kali untuk mengurangi spam
+        static int logCounter = 0;
+        if (++logCounter % 20 == 0) {
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                "📹 Cached sources: %zu (fresh: %u)", validSources.size(), no_sources);
+        }
+    } else {
+        result = env->NewObjectArray(0, env->FindClass("java/lang/String"), nullptr);
+
+        static int noSourceCounter = 0;
+        if (++noSourceCounter % 10 == 0) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "⚠️ No valid cached sources");
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// CLEANUP FINDER (for shutdown)
+// ============================================================================
+static void cleanupPersistentFinder() {
+    std::lock_guard<std::mutex> lock(g_finderMutex);
+
+    if (g_pNDI_find) {
+        NDIlib_find_destroy(g_pNDI_find);
+        g_pNDI_find = nullptr;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Persistent finder destroyed");
+    }
+
+    // Clear cache
+    {
+        std::lock_guard<std::mutex> cacheLock(g_sourceCacheMutex);
+        g_sourceCache.clear();
+        __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Source cache cleared");
+    }
+}
+
+// ============================================================================
+// CONNECT TO SPECIFIC SOURCE
+// ============================================================================
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_myapplication_MainActivity_connectToNDISource(
         JNIEnv* env,
         jobject /* this */,
-        jobject surface) {
-    __android_log_print(ANDROID_LOG_INFO, TAG, "startNDIReceiver called");
+        jstring sourceFullName,
+        jobject surface,
+        jint quality) {
 
-    // Get ANativeWindow from Surface
+    __android_log_print(ANDROID_LOG_INFO, TAG, "🔌 Connecting to NDI source...");
+
+    // Stop existing receiver
+    {
+        std::lock_guard<std::mutex> lock(g_receiverMutex);
+        if (g_receiverRunning) {
+            g_receiverRunning = false;
+            if (g_receiverThread.joinable()) {
+                g_receiverThread.join();
+            }
+        }
+        if (g_pNDI_recv) {
+            NDIlib_recv_destroy(g_pNDI_recv);
+            g_pNDI_recv = nullptr;
+        }
+        if (g_window) {
+            ANativeWindow_release(g_window);
+            g_window = nullptr;
+        }
+    }
+
+    // Get source name
+    const char* sourceNameChars = env->GetStringUTFChars(sourceFullName, nullptr);
+    std::string sourceNameStr(sourceNameChars);
+    env->ReleaseStringUTFChars(sourceFullName, sourceNameChars);
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "Looking for: %s", sourceNameStr.c_str());
+
+    // Get window
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     if (!window) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "ANativeWindow_fromSurface returned NULL");
-        return;
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Window creation failed");
+        return JNI_FALSE;
     }
+    g_window = window;
 
-    // Initialize NDI
-    if (!NDIlib_initialize()) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "NDIlib_initialize failed");
-        // Handle error
+    // Initialize persistent finder
+    if (!initializePersistentFinder()) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Finder init failed");
         ANativeWindow_release(window);
-        return;
+        g_window = nullptr;
+        return JNI_FALSE;
     }
 
-    // Create finder
-    NDIlib_find_instance_t pNDI_find = NDIlib_find_create_v2();
+    // Try to find source in cache first
+    const NDIlib_source_t* target_source = nullptr;
+    NDIlib_source_t cached_source;
+    bool foundInCache = false;
 
-    if (!pNDI_find) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "NDIlib_find_create_v2 returned NULL");
-        ANativeWindow_release(window);
-        return;
-    }
-
-    // Wait for sources with longer timeout and more attempts
-    uint32_t no_sources = 0;
-    const NDIlib_source_t* p_sources = NULL;
-
-    // Increase attempts to 30 (30 seconds total) to allow more time for discovery
-    int waitCount = 0;
-    while ((!p_sources || no_sources == 0) && waitCount < 30) {
-        __android_log_print(ANDROID_LOG_INFO, TAG, "Waiting for NDI sources... (attempt %d/30)", waitCount + 1);
-        NDIlib_find_wait_for_sources(pNDI_find, 2000); // Wait 2 seconds per attempt
-        p_sources = NDIlib_find_get_current_sources(pNDI_find, &no_sources);
-        __android_log_print(ANDROID_LOG_INFO, TAG, "Found %d sources", no_sources);
-        if (p_sources && no_sources > 0) {
-            for (uint32_t i = 0; i < no_sources; i++) {
-                __android_log_print(ANDROID_LOG_INFO, TAG, "  Source %d: %s (%s)", i, p_sources[i].p_ndi_name, p_sources[i].p_url_address);
-            }
-            break;
+    {
+        std::lock_guard<std::mutex> cacheLock(g_sourceCacheMutex);
+        auto it = g_sourceCache.find(sourceNameStr);
+        if (it != g_sourceCache.end()) {
+            cached_source = it->second.source;
+            target_source = &cached_source;
+            foundInCache = true;
+            __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Found in cache!");
         }
-        waitCount++;
     }
 
-    if (!p_sources || no_sources == 0) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "No NDI sources found after 60 seconds - cannot continue");
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "Troubleshooting: 1) Check both devices on same subnet 2) Disable firewall on laptop 3) Check NDI sender is running 4) Try restarting NDI sender");
-        // Clean up finder
-        NDIlib_find_destroy(pNDI_find);
+    // If not in cache, search actively
+    if (!foundInCache) {
+        std::lock_guard<std::mutex> lock(g_finderMutex);
+
+        uint32_t no_sources = 0;
+        const NDIlib_source_t* p_sources = nullptr;
+
+        // Quick search (max 5 attempts)
+        for (int attempt = 0; attempt < 5 && !target_source; attempt++) {
+            NDIlib_find_wait_for_sources(g_pNDI_find, 500);
+            p_sources = NDIlib_find_get_current_sources(g_pNDI_find, &no_sources);
+
+            if (p_sources && no_sources > 0) {
+                // Update cache
+                updateSourceCache(p_sources, no_sources);
+
+                // Find target
+                for (uint32_t i = 0; i < no_sources; i++) {
+                    if (sourceNameStr == p_sources[i].p_ndi_name) {
+                        target_source = &p_sources[i];
+                        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "✓ Found target source (attempt %d)!", attempt + 1);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!target_source) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Source not found: %s",
+            sourceNameStr.c_str());
         ANativeWindow_release(window);
-        return;
+        g_window = nullptr;
+        return JNI_FALSE;
     }
 
-    // Create receiver with explicit settings requesting BGRA/BGRX formats
+    // Create receiver
     NDIlib_recv_create_v3_t recv_settings;
-    recv_settings.source_to_connect_to = p_sources[0];
-    recv_settings.color_format = NDIlib_recv_color_format_BGRX_BGRA; // prefer BGRA/BGRX output
-    recv_settings.bandwidth = NDIlib_recv_bandwidth_highest; // use highest for quality
+    recv_settings.source_to_connect_to = *target_source;
+    recv_settings.color_format = NDIlib_recv_color_format_BGRX_BGRA;
+
+    // Set bandwidth based on quality
+    switch(quality) {
+        case 360:
+            recv_settings.bandwidth = NDIlib_recv_bandwidth_lowest;
+            break;
+        case 720:
+            recv_settings.bandwidth = NDIlib_recv_bandwidth_highest;
+            break;
+        case 1080:
+        default:
+            recv_settings.bandwidth = NDIlib_recv_bandwidth_highest;
+            break;
+    }
+
     recv_settings.allow_video_fields = true;
-    recv_settings.p_ndi_recv_name = "AndroidNDIReceiver";
+    recv_settings.p_ndi_recv_name = "Android NDI Receiver";
 
     NDIlib_recv_instance_t pNDI_recv = NDIlib_recv_create_v3(&recv_settings);
 
     if (!pNDI_recv) {
-        __android_log_print(ANDROID_LOG_ERROR, TAG, "NDIlib_recv_create_v3 failed");
-        NDIlib_find_destroy(pNDI_find);
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Receiver creation failed");
         ANativeWindow_release(window);
-        return;
+        g_window = nullptr;
+        return JNI_FALSE;
     }
 
-    // Connect to source
-    NDIlib_recv_connect(pNDI_recv, p_sources);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Receiver created");
 
-    // Destroy finder (we no longer need it)
-    NDIlib_find_destroy(pNDI_find);
+    // Store global receiver
+    {
+        std::lock_guard<std::mutex> lock(g_receiverMutex);
+        g_pNDI_recv = pNDI_recv;
+        g_receiverRunning = true;
+    }
 
     // Start receiver thread
-    std::thread receiverThread([pNDI_recv, window]() {
-        __android_log_print(ANDROID_LOG_INFO, TAG, "Receiver thread started");
+    g_receiverThread = std::thread([window]() {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "📺 Receiver thread started");
 
-        while (true) {
+        NDIlib_recv_instance_t pNDI_recv = g_pNDI_recv;
+        int frameCount = 0;
+        auto startTime = std::chrono::steady_clock::now();
+
+        while (g_receiverRunning && pNDI_recv) {
             NDIlib_video_frame_v2_t video_frame;
             NDIlib_audio_frame_v3_t audio_frame;
             NDIlib_metadata_frame_t metadata_frame;
 
-            NDIlib_frame_type_e frameType = NDIlib_recv_capture_v3(pNDI_recv, &video_frame, &audio_frame, &metadata_frame, 1000);
+            NDIlib_frame_type_e frameType = NDIlib_recv_capture_v3(
+                pNDI_recv, &video_frame, &audio_frame, &metadata_frame, 1000);
+
             switch (frameType) {
                 case NDIlib_frame_type_video: {
+                    frameCount++;
+
                     char fourccStr[5];
                     fourcc_to_string((uint32_t)video_frame.FourCC, fourccStr);
-                    __android_log_print(ANDROID_LOG_DEBUG, TAG, "Received video frame: %dx%d, FourCC=%s (0x%08" PRIx32 ") stride=%d", video_frame.xres, video_frame.yres, fourccStr, (uint32_t)video_frame.FourCC, video_frame.line_stride_in_bytes);
+
+                    // Log every 60 frames
+                    if (frameCount % 60 == 0) {
+                        auto now = std::chrono::steady_clock::now();
+                        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - startTime).count();
+                        float fps = elapsed > 0 ? (float)frameCount / elapsed : 0;
+
+                        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "📊 %dx%d %s @ %.1f fps",
+                            video_frame.xres, video_frame.yres, fourccStr, fps);
+                    }
 
                     if (window) {
-                        // Set buffers geometry. Try to use RGBA_8888 which Android supports widely.
-                        ANativeWindow_setBuffersGeometry(window, video_frame.xres, video_frame.yres, WINDOW_FORMAT_RGBA_8888);
+                        ANativeWindow_setBuffersGeometry(
+                            window, video_frame.xres, video_frame.yres,
+                            WINDOW_FORMAT_RGBA_8888);
 
                         ANativeWindow_Buffer buffer;
-                        int lockRes = ANativeWindow_lock(window, &buffer, nullptr);
-                        if (lockRes != 0) {
-                            __android_log_print(ANDROID_LOG_ERROR, TAG, "ANativeWindow_lock failed: %d", lockRes);
-                            NDIlib_recv_free_video_v2(pNDI_recv, &video_frame);
-                            continue;
-                        }
+                        if (ANativeWindow_lock(window, &buffer, nullptr) == 0) {
+                            uint8_t* dst = (uint8_t*)buffer.bits;
+                            uint8_t* src = (uint8_t*)video_frame.p_data;
+                            int height = video_frame.yres;
+                            int width = video_frame.xres;
+                            int dstStrideBytes = buffer.stride * 4;
+                            int srcStride = video_frame.line_stride_in_bytes;
 
-                        uint8_t* dst = (uint8_t*)buffer.bits;
-                        uint8_t* src = (uint8_t*)video_frame.p_data;
-                        int height = video_frame.yres;
-                        int width = video_frame.xres;
-                        int dstStrideBytes = buffer.stride * 4; // stride pixels * 4 bytes
-                        int srcStride = video_frame.line_stride_in_bytes;
+                            bool handled = false;
 
-                        bool handled = false;
-
-                        // Handle BGRA/BGRX (src B G R A or B G R X)
-                        if (video_frame.FourCC == NDIlib_FourCC_video_type_BGRA || video_frame.FourCC == NDIlib_FourCC_video_type_BGRX) {
-                            for (int y = 0; y < height; y++) {
-                                uint8_t* srow = src + y * srcStride;
-                                uint8_t* drow = dst + y * dstStrideBytes;
-                                for (int x = 0; x < width; x++) {
-                                    uint8_t b = srow[x*4 + 0];
-                                    uint8_t g = srow[x*4 + 1];
-                                    uint8_t r = srow[x*4 + 2];
-                                    uint8_t a = (video_frame.FourCC == NDIlib_FourCC_video_type_BGRA) ? srow[x*4 + 3] : 0xFF;
-                                    drow[x*4 + 0] = r;
-                                    drow[x*4 + 1] = g;
-                                    drow[x*4 + 2] = b;
-                                    drow[x*4 + 3] = a;
+                            // BGRA/BGRX
+                            if (video_frame.FourCC == NDIlib_FourCC_video_type_BGRA ||
+                                video_frame.FourCC == NDIlib_FourCC_video_type_BGRX) {
+                                for (int y = 0; y < height; y++) {
+                                    uint8_t* srow = src + y * srcStride;
+                                    uint8_t* drow = dst + y * dstStrideBytes;
+                                    for (int x = 0; x < width; x++) {
+                                        uint8_t b = srow[x*4 + 0];
+                                        uint8_t g = srow[x*4 + 1];
+                                        uint8_t r = srow[x*4 + 2];
+                                        uint8_t a = (video_frame.FourCC == NDIlib_FourCC_video_type_BGRA) ?
+                                            srow[x*4 + 3] : 0xFF;
+                                        drow[x*4 + 0] = r;
+                                        drow[x*4 + 1] = g;
+                                        drow[x*4 + 2] = b;
+                                        drow[x*4 + 3] = a;
+                                    }
                                 }
+                                handled = true;
                             }
-                            handled = true;
-                        }
 
-                        // Handle RGBA/RGBX: likely already in correct order (R G B A)
-                        if (!handled && (video_frame.FourCC == NDIlib_FourCC_video_type_RGBA || video_frame.FourCC == NDIlib_FourCC_video_type_RGBX)) {
-                            // copy line by line respecting strides
-                            for (int y = 0; y < height; y++) {
-                                uint8_t* srow = src + y * srcStride;
-                                uint8_t* drow = dst + y * dstStrideBytes;
-                                memcpy(drow, srow, (size_t) (width * 4));
-                            }
-                            handled = true;
-                        }
-
-                        // Handle UYVY / UYVA packed YUV 4:2:2 -> convert to RGBA
-                        if (!handled && (video_frame.FourCC == NDIlib_FourCC_video_type_UYVY || video_frame.FourCC == NDIlib_FourCC_video_type_UYVA)) {
-                            // src layout per 4 bytes: U Y0 V Y1 -> two pixels
-                            auto clamp = [](int v) -> uint8_t { if (v < 0) return 0; if (v > 255) return 255; return (uint8_t)v; };
-                            for (int y = 0; y < height; y++) {
-                                uint8_t* srow = src + y * srcStride;
-                                uint8_t* drow = dst + y * dstStrideBytes;
-                                int srcIndex = 0;
-                                for (int x = 0; x < width; x += 2, srcIndex += 4) {
-                                    int U = (int)srow[srcIndex + 0] - 128;
-                                    int Y0 = (int)srow[srcIndex + 1] - 16;
-                                    int V = (int)srow[srcIndex + 2] - 128;
-                                    int Y1 = (int)srow[srcIndex + 3] - 16;
-
-                                    if (Y0 < 0) Y0 = 0;
-                                    if (Y1 < 0) Y1 = 0;
-
-                                    int C1 = 298 * Y0;
-                                    int R1 = (C1 + 409 * V + 128) >> 8;
-                                    int G1 = (C1 - 100 * U - 208 * V + 128) >> 8;
-                                    int B1 = (C1 + 516 * U + 128) >> 8;
-
-                                    int C2 = 298 * Y1;
-                                    int R2 = (C2 + 409 * V + 128) >> 8;
-                                    int G2 = (C2 - 100 * U - 208 * V + 128) >> 8;
-                                    int B2 = (C2 + 516 * U + 128) >> 8;
-
-                                    // write pixel x
-                                    drow[(x+0)*4 + 0] = clamp(R1);
-                                    drow[(x+0)*4 + 1] = clamp(G1);
-                                    drow[(x+0)*4 + 2] = clamp(B1);
-                                    drow[(x+0)*4 + 3] = 0xFF;
-
-                                    // write pixel x+1
-                                    drow[(x+1)*4 + 0] = clamp(R2);
-                                    drow[(x+1)*4 + 1] = clamp(G2);
-                                    drow[(x+1)*4 + 2] = clamp(B2);
-                                    drow[(x+1)*4 + 3] = 0xFF;
+                            // RGBA/RGBX
+                            if (!handled && (video_frame.FourCC == NDIlib_FourCC_video_type_RGBA ||
+                                video_frame.FourCC == NDIlib_FourCC_video_type_RGBX)) {
+                                for (int y = 0; y < height; y++) {
+                                    memcpy(dst + y * dstStrideBytes,
+                                           src + y * srcStride, width * 4);
                                 }
+                                handled = true;
                             }
-                            handled = true;
-                        }
 
-                        // Handle NV12 planar YUV 4:2:0 -> convert to RGBA
-                        if (!handled && video_frame.FourCC == NDIlib_FourCC_video_type_NV12) {
-                            // NV12: Y plane (full res), UV interleaved (half res)
-                            uint8_t* yPlane = src;
-                            uint8_t* uvPlane = src + (height * srcStride); // UV starts after Y
-                            auto clamp = [](int v) -> uint8_t { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; };
-                            for (int y = 0; y < height; y++) {
-                                uint8_t* drow = dst + y * dstStrideBytes;
-                                for (int x = 0; x < width; x++) {
-                                    int yVal = yPlane[y * srcStride + x] - 16;
-                                    int uVal = uvPlane[(y/2) * (srcStride/2) + (x/2)*2 + 0] - 128;
-                                    int vVal = uvPlane[(y/2) * (srcStride/2) + (x/2)*2 + 1] - 128;
-                                    if (yVal < 0) yVal = 0;
-                                    int C = yVal * 298;
-                                    int R = (C + 409 * vVal + 128) >> 8;
-                                    int G = (C - 100 * uVal - 208 * vVal + 128) >> 8;
-                                    int B = (C + 516 * uVal + 128) >> 8;
-                                    drow[x*4 + 0] = clamp(R);
-                                    drow[x*4 + 1] = clamp(G);
-                                    drow[x*4 + 2] = clamp(B);
-                                    drow[x*4 + 3] = 0xFF;
+                            // UYVY/UYVA
+                            if (!handled && (video_frame.FourCC == NDIlib_FourCC_video_type_UYVY ||
+                                video_frame.FourCC == NDIlib_FourCC_video_type_UYVA)) {
+                                auto clamp = [](int v) -> uint8_t {
+                                    return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+                                };
+                                for (int y = 0; y < height; y++) {
+                                    uint8_t* srow = src + y * srcStride;
+                                    uint8_t* drow = dst + y * dstStrideBytes;
+                                    int srcIndex = 0;
+                                    for (int x = 0; x < width; x += 2, srcIndex += 4) {
+                                        int U = (int)srow[srcIndex + 0] - 128;
+                                        int Y0 = (int)srow[srcIndex + 1] - 16;
+                                        int V = (int)srow[srcIndex + 2] - 128;
+                                        int Y1 = (int)srow[srcIndex + 3] - 16;
+                                        if (Y0 < 0) Y0 = 0;
+                                        if (Y1 < 0) Y1 = 0;
+
+                                        int C1 = 298 * Y0;
+                                        drow[(x+0)*4 + 0] = clamp((C1 + 409*V + 128) >> 8);
+                                        drow[(x+0)*4 + 1] = clamp((C1 - 100*U - 208*V + 128) >> 8);
+                                        drow[(x+0)*4 + 2] = clamp((C1 + 516*U + 128) >> 8);
+                                        drow[(x+0)*4 + 3] = 0xFF;
+
+                                        int C2 = 298 * Y1;
+                                        drow[(x+1)*4 + 0] = clamp((C2 + 409*V + 128) >> 8);
+                                        drow[(x+1)*4 + 1] = clamp((C2 - 100*U - 208*V + 128) >> 8);
+                                        drow[(x+1)*4 + 2] = clamp((C2 + 516*U + 128) >> 8);
+                                        drow[(x+1)*4 + 3] = 0xFF;
+                                    }
                                 }
+                                handled = true;
                             }
-                            handled = true;
-                        }
 
-                        if (!handled) {
-                            __android_log_print(ANDROID_LOG_WARN, TAG, "Unsupported FourCC %s (0x%08" PRIx32 ") - skipping frame", fourccStr, (uint32_t)video_frame.FourCC);
-                        }
+                            // NV12
+                            if (!handled && video_frame.FourCC == NDIlib_FourCC_video_type_NV12) {
+                                uint8_t* yPlane = src;
+                                uint8_t* uvPlane = src + (height * srcStride);
+                                auto clamp = [](int v) -> uint8_t {
+                                    return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v;
+                                };
+                                for (int y = 0; y < height; y++) {
+                                    uint8_t* drow = dst + y * dstStrideBytes;
+                                    for (int x = 0; x < width; x++) {
+                                        int yVal = yPlane[y * srcStride + x] - 16;
+                                        int uVal = uvPlane[(y/2) * (srcStride/2) + (x/2)*2 + 0] - 128;
+                                        int vVal = uvPlane[(y/2) * (srcStride/2) + (x/2)*2 + 1] - 128;
+                                        if (yVal < 0) yVal = 0;
+                                        int C = yVal * 298;
+                                        drow[x*4 + 0] = clamp((C + 409*vVal + 128) >> 8);
+                                        drow[x*4 + 1] = clamp((C - 100*uVal - 208*vVal + 128) >> 8);
+                                        drow[x*4 + 2] = clamp((C + 516*uVal + 128) >> 8);
+                                        drow[x*4 + 3] = 0xFF;
+                                    }
+                                }
+                                handled = true;
+                            }
 
-                        ANativeWindow_unlockAndPost(window);
-                        NDIlib_recv_free_video_v2(pNDI_recv, &video_frame);
+                            if (!handled) {
+                                __android_log_print(ANDROID_LOG_WARN, TAG,
+                                    "⚠️ Unsupported FourCC: %s", fourccStr);
+                            }
+
+                            ANativeWindow_unlockAndPost(window);
+                        }
                     }
+
+                    NDIlib_recv_free_video_v2(pNDI_recv, &video_frame);
                     break;
                 }
+
                 case NDIlib_frame_type_audio:
-                    __android_log_print(ANDROID_LOG_DEBUG, TAG, "Received audio frame");
                     NDIlib_recv_free_audio_v3(pNDI_recv, &audio_frame);
                     break;
+
                 case NDIlib_frame_type_metadata:
-                    __android_log_print(ANDROID_LOG_DEBUG, TAG, "Received metadata frame");
                     NDIlib_recv_free_metadata(pNDI_recv, &metadata_frame);
                     break;
-                case NDIlib_frame_type_none:
-                    // no data this cycle
-                    break;
+
                 case NDIlib_frame_type_error:
-                    __android_log_print(ANDROID_LOG_ERROR, TAG, "NDI recv error (connection lost?) - exiting thread");
-                    // release window and exit thread
-                    ANativeWindow_release(window);
-                    return;
+                    __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ Connection error");
+                    g_receiverRunning = false;
+                    break;
+
                 default:
                     break;
             }
         }
+
+        __android_log_print(ANDROID_LOG_INFO, TAG, "📺 Receiver thread stopped");
     });
 
-    receiverThread.detach();
+    g_receiverThread.detach();
 
-    // Note: In a real app, store thread handle to join on destroy; keep window reference until exit
+    __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Connection successful");
+    return JNI_TRUE;
+}
+
+// ============================================================================
+// STOP RECEIVER
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_myapplication_MainActivity_stopNDIReceiver(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "🛑 Stopping receiver...");
+
+    std::lock_guard<std::mutex> lock(g_receiverMutex);
+
+    g_receiverRunning = false;
+
+    if (g_receiverThread.joinable()) {
+        g_receiverThread.join();
+    }
+
+    if (g_pNDI_recv) {
+        NDIlib_recv_destroy(g_pNDI_recv);
+        g_pNDI_recv = nullptr;
+    }
+
+    if (g_window) {
+        ANativeWindow_release(g_window);
+        g_window = nullptr;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "✓ Receiver stopped");
+}
+
+// ============================================================================
+// CLEANUP ALL (untuk shutdown app)
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_myapplication_NDIManager_cleanup(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "🧹 Cleaning up NDI...");
+
+    // Stop receiver first
+    Java_com_example_myapplication_MainActivity_stopNDIReceiver(env, nullptr);
+
+    // Cleanup finder
+    cleanupPersistentFinder();
+
+    // Deinitialize NDI
+    if (g_ndi_initialized) {
+        NDIlib_destroy();
+        g_ndi_initialized = false;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "✓ NDI deinitialized");
+    }
+}
+
+// ============================================================================
+// LEGACY COMPATIBILITY
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_myapplication_MainActivity_startNDIReceiver(
+        JNIEnv* env,
+        jobject thiz,
+        jobject surface) {
+
+    // This is for backward compatibility
+    // Auto-connect to first available source
+    __android_log_print(ANDROID_LOG_INFO, TAG, "Auto-connecting to first source...");
+
+    // Find sources
+    jobjectArray sources = Java_com_example_myapplication_NDIManager_findNDISources(env, thiz);
+
+    if (env->GetArrayLength(sources) > 0) {
+        jstring firstSource = (jstring)env->GetObjectArrayElement(sources, 0);
+        Java_com_example_myapplication_MainActivity_connectToNDISource(
+            env, thiz, firstSource, surface, 720);
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR, TAG, "❌ No sources found for auto-connect");
+    }
 }
